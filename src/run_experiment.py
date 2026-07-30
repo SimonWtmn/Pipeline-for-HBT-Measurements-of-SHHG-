@@ -42,7 +42,7 @@ CONFIG = ExperimentConfig(
     # ----------------- identity -----------------
     MATERIAL="CdTe110",
     EXPERIENCE_TYPE="Polarization_Scan",
-    DATE="29072026",
+    DATE="30072026",
     POWER_LEVEL="50mW",
 
     # ----------------- optics / metadata -----------------
@@ -52,7 +52,7 @@ CONFIG = ExperimentConfig(
     P2={"present": False, "angle_deg": 0.0},
     P3={"present": False, "angle_deg": 0.0},
     HWP_ANGLE_DEG=0.0,
-    COVER={"present": True, "description": "between harmonics"},
+    COVER={"present": True, "description": "between channels"},
     FILTERS={
         "H3": {"separation": "per-channel", "filter": "700-40"},
         "H4": {"separation": "per-channel", "filter": "520=40"},
