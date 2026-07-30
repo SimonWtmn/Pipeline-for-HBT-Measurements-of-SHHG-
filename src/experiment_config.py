@@ -18,9 +18,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from hardware import RotationStageConfig, wrap_360
+    from hardware import (ELLIPTICITY_LOG_NAME, SCAN_LOG_NAME, RotationStageConfig,
+                          wrap_360)
 except ImportError:  # pragma: no cover - import style depends on the entry point
-    from src.hardware import RotationStageConfig, wrap_360
+    from src.hardware import (ELLIPTICITY_LOG_NAME, SCAN_LOG_NAME, RotationStageConfig,
+                              wrap_360)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -92,41 +94,70 @@ class ExperimentConfig:
     ROTATION_STAGE: Optional[RotationStageConfig] = None
     ROTATION_ANGLE_DEG: Optional[float] = None  # angle of THIS run; set per scan step
 
-    # ---------- Polarization scan (optional) ----------
-    # One acquisition per angle, at a single power. The HWP angle that delivers
-    # POLARIZATION_POWER at each angle comes from the lookup table measured by the
-    # lab's calibration script; angles the table cannot reach are skipped.
-    #   POLARIZATION_SCAN = np.arange(0.0, 360.0, 10.0)
-    POLARIZATION_SCAN: Optional[Sequence[float]] = None
-    POLARIZATION_POWER: float = 0.0  # in the calibration's unit (mW or Hz), not a label
-    # Several power labels already recorded as polarization scans in the same DATE
-    # folder (e.g. ["25mW", "45mW", "65mW"]). Used by analyze-only to rebuild each
-    # per-power summary and the multi-power butterfly overlay.
-    POLARIZATION_POWERS: Optional[List[str]] = None
+    # ---------- The pump mounts (shared by the laser-angle and ellipticity scans) ----------
+    # P1 and the HWP sit BEFORE the crystal and set the pump's linear polarization:
+    # P1 turns to the requested laser angle, and the HWP to whatever angle the measured
+    # lookup table says delivers PUMP_POWER there. Angles the table cannot reach are
+    # skipped.
+    PUMP_POWER: float = 0.0  # in the calibration's unit (mW or Hz), not a label
+    # Several power labels already recorded in the same DATE folder (e.g. ["25mW",
+    # "45mW", "65mW"]). Used by analyze-only to rebuild each per-power summary and the
+    # multi-power overlay.
+    PUMP_POWERS: Optional[List[str]] = None
+    # Acquire the whole scan at each of several powers in one run. Each entry pairs a
+    # file label with the power (calibration unit) every angle is set to:
+    #   PUMP_POWER_SCAN = [{"power": "50mW", "requested_power": 50.0},
+    #                      {"power": "60mW", "requested_power": 60.0}]
+    PUMP_POWER_SCAN: Optional[List[Dict[str, Any]]] = None
     # A calibration is reused run after run: recording one takes hours, and the table
     # only goes stale when the beam path changes. None picks
     # polarization_calibration/linear_polarization_lookup_latest.npz.
-    POLARIZATION_CALIBRATION: Optional[Path] = None
-    POLARIZATION_CALIBRATION_DIR: Optional[Path] = None
-    POLARIZATION_STAGE_ENABLED: bool = False
-    POLARIZATION_STAGE_DRY_RUN: bool = False
-    POLARIZATION_P1: Optional[RotationStageConfig] = None
-    POLARIZATION_HWP: Optional[RotationStageConfig] = None
-    POLARIZATION_SETTLE_TIME_S: float = 0.2
-    POLARIZATION_ANGLE_DEG: Optional[float] = None  # angle of THIS run; set per scan step
+    PUMP_CALIBRATION: Optional[Path] = None
+    PUMP_CALIBRATION_DIR: Optional[Path] = None
+    PUMP_STAGE_ENABLED: bool = False
+    PUMP_STAGE_DRY_RUN: bool = False
+    PUMP_P1: Optional[RotationStageConfig] = None
+    PUMP_HWP: Optional[RotationStageConfig] = None
+    PUMP_SETTLE_TIME_S: float = 0.2
     # Base power label of THIS acquisition (kept when POWER_LEVEL becomes the
-    # per-angle file label "50mW_pol000p0").
-    POLARIZATION_BASE_POWER: Optional[str] = None
-    # Acquire a full angle scan at each of several powers in one run. Each entry pairs
-    # a file/label with the power (calibration unit) every angle is set to:
-    #   POLARIZATION_POWER_SCAN = [{"power": "50mW", "requested_power": 50.0},
-    #                              {"power": "60mW", "requested_power": 60.0}]
-    # Results land under results/.../polarization/{power}/ exactly like a single power.
-    POLARIZATION_POWER_SCAN: Optional[List[Dict[str, Any]]] = None
-    # Per-angle analysis trees (results/.../polarization/{power}/angles/) are heavy and
+    # per-point file label "50mW_las000p0").
+    PUMP_BASE_POWER: Optional[str] = None
+
+    # ---------- Laser angle scan (optional) ----------
+    # One acquisition per pump polarization angle, at a single power: what the crystal
+    # emits as its axes are turned relative to the pump.
+    #   LASER_ANGLE_SCAN = np.arange(0.0, 360.0, 10.0)
+    LASER_ANGLE_SCAN: Optional[Sequence[float]] = None
+    LASER_ANGLE_DEG: Optional[float] = None  # pump angle of THIS run; set per scan step
+    # Per-angle analysis trees (results/.../laser_angle/{power}/angles/) are heavy and
     # rarely the first thing you look at. Off by default: the vs-angle summaries are
     # always drawn; set this True to also analyse every single angle.
-    POLARIZATION_PLOT_ANGLES: bool = False
+    LASER_ANGLE_PLOT_ANGLES: bool = False
+
+    # ---------- Ellipticity scan (optional) ----------
+    # The polarization of the HARMONICS, measured AFTER the crystal: a half-wave plate
+    # in front of a fixed polarizer is rotated at each pump angle, and the modulation of
+    # the intensity it transmits says how elliptical the emission is (a flat curve is
+    # circular, one reaching zero is linear).
+    #   ELLIPTICITY_LASER_ANGLES = [0.0, 45.0, 90.0]        # the outer loop
+    #   ELLIPTICITY_ANALYZER_ANGLES = np.arange(0.0, 180.0, 15.0)   # the inner loop
+    ELLIPTICITY_LASER_ANGLES: Optional[Sequence[float]] = None
+    ELLIPTICITY_ANALYZER_ANGLES: Sequence[float] = field(
+        default_factory=lambda: np.arange(0.0, 180.0, 15.0))
+    ELLIPTICITY_ANALYZER: Optional[RotationStageConfig] = None
+    ELLIPTICITY_ANALYZER_ENABLED: bool = False
+    ELLIPTICITY_ANALYZER_DRY_RUN: bool = False
+    ELLIPTICITY_ANALYZER_SETTLE_TIME_S: float = 0.2
+    # A half-wave plate turns the polarization by twice its own angle, so what the fixed
+    # polarizer transmits repeats every 90 deg of plate angle. That is the period the
+    # sinusoidal fit is held at; change it only if the analyzer is not a HWP.
+    ELLIPTICITY_FIT_PERIOD_DEG: float = 90.0
+    #: Metadata only: the angle of the fixed polarizer after the plate (0 = vertical).
+    ELLIPTICITY_FIXED_POLARIZER_DEG: float = 0.0
+    ANALYZER_ANGLE_DEG: Optional[float] = None  # analyzer angle of THIS run
+    # Per-point HBT trees (results/.../ellipticity/{power}/{laser angle}/points/) are
+    # heavy: one per (laser angle, analyzer angle) pair. Off by default.
+    ELLIPTICITY_PLOT_POINTS: bool = False
 
     # ---------- Analysis ----------
     INTEGRATION_WINDOW: int = 8
@@ -138,18 +169,21 @@ class ExperimentConfig:
         if self.REGISTERED_CHANNELS is None:
             self.REGISTERED_CHANNELS = sorted(self.MODES)
         self._validate_power_scan()
-        self._validate_polarization_scan()
-        if self.POLARIZATION_POWERS:
-            _reject_nested_labels(list(self.POLARIZATION_POWERS), "POLARIZATION_POWERS")
+        self._validate_laser_angle_scan()
+        self._validate_ellipticity_scan()
+        if self.PUMP_POWERS:
+            _reject_nested_labels(list(self.PUMP_POWERS), "PUMP_POWERS")
         if self.POWER_SCAN:
             # The scan is what was actually recorded, so it defines what to analyse.
             self.POWER_LEVELS = [power for power, _angle in self.power_scan_points()]
-        elif self.POLARIZATION_SCAN is not None:
-            self.POWER_LEVELS = [label for _angle, label in self.polarization_scan_points()]
+        elif self.LASER_ANGLE_SCAN is not None:
+            self.POWER_LEVELS = [label for _angle, label in self.laser_angle_scan_points()]
+        elif self.ELLIPTICITY_LASER_ANGLES is not None:
+            self.POWER_LEVELS = [label for _la, _aa, label in self.ellipticity_scan_points()]
         if self.POWER_LEVELS is None:
             self.POWER_LEVELS = [self.POWER_LEVEL]
-        if self.POLARIZATION_CALIBRATION_DIR is None:
-            self.POLARIZATION_CALIBRATION_DIR = REPO_ROOT / "polarization_calibration"
+        if self.PUMP_CALIBRATION_DIR is None:
+            self.PUMP_CALIBRATION_DIR = REPO_ROOT / "polarization_calibration"
         if self.DATA_DIR is None:
             self.DATA_DIR = REPO_ROOT / "data" / self.MATERIAL / self.EXPERIENCE_TYPE / self.DATE
         if self.RESULTS_DIR is None:
@@ -188,62 +222,121 @@ class ExperimentConfig:
 
         _reject_nested_labels(sorted(seen), "POWER_SCAN")
 
-    def _validate_polarization_scan(self) -> None:
-        if self.POLARIZATION_SCAN is None:
+    def _validate_laser_angle_scan(self) -> None:
+        if self.LASER_ANGLE_SCAN is None:
             return
 
-        angles = [float(angle) for angle in self.POLARIZATION_SCAN]
+        angles = [float(angle) for angle in self.LASER_ANGLE_SCAN]
         if not angles:
-            self.POLARIZATION_SCAN = None
+            self.LASER_ANGLE_SCAN = None
             return
         if self.POWER_SCAN:
             raise ValueError(
-                "POWER_SCAN and POLARIZATION_SCAN are both set: that would multiply into "
+                "POWER_SCAN and LASER_ANGLE_SCAN are both set: that would multiply into "
                 "one acquisition per (power, angle) pair. Run one scan at a time."
             )
-
-        # Labels resolve 0.1 deg, so two angles closer than that would share their
-        # files. Checking the labels catches both a repeated and a too-close angle.
-        labels = [angle_tag(angle) for angle in angles]
-        duplicates = sorted({label for label in labels if labels.count(label) > 1})
-        if duplicates:
+        if self.ELLIPTICITY_LASER_ANGLES is not None:
             raise ValueError(
-                f"POLARIZATION_SCAN maps several angles onto the same file label {duplicates}: "
-                "angles must differ by at least 0.1 deg once wrapped into [0, 360)."
+                "LASER_ANGLE_SCAN and ELLIPTICITY_LASER_ANGLES are both set: the first "
+                "records one acquisition per pump angle, the second a whole analyzer "
+                "sweep at each pump angle. Run one scan at a time."
             )
-        self.POLARIZATION_SCAN = angles
+
+        _reject_duplicate_angle_labels(angles, "LASER_ANGLE_SCAN", laser_angle_tag)
+        self.LASER_ANGLE_SCAN = angles
 
         if self.ANALYZE_ONLY:
             return
-        if self.POLARIZATION_POWER_SCAN:
-            self._validate_polarization_power_scan()
-        elif self.POLARIZATION_POWER <= 0:
-            raise ValueError(
-                "POLARIZATION_SCAN needs POLARIZATION_POWER: the power every angle is set "
-                "to, in the unit of the calibration table (mW for a power-meter table). "
-                "For several powers in one run, use POLARIZATION_POWER_SCAN instead."
-            )
-        if self.POLARIZATION_STAGE_DRY_RUN:
+        self._validate_pump_power("LASER_ANGLE_SCAN")
+        self._validate_pump_stages("LASER_ANGLE_SCAN")
+
+    def _validate_ellipticity_scan(self) -> None:
+        if self.ELLIPTICITY_LASER_ANGLES is None:
             return
-        if not self.POLARIZATION_STAGE_ENABLED:
+
+        laser_angles = [float(angle) for angle in self.ELLIPTICITY_LASER_ANGLES]
+        if not laser_angles:
+            self.ELLIPTICITY_LASER_ANGLES = None
+            return
+        if self.POWER_SCAN:
             raise ValueError(
-                "POLARIZATION_SCAN is set but POLARIZATION_STAGE_ENABLED is False: every "
-                "angle would be recorded at whatever polarization the mounts happen to "
-                "hold. Enable the mounts, or set POLARIZATION_STAGE_DRY_RUN=True."
+                "POWER_SCAN and ELLIPTICITY_LASER_ANGLES are both set: that would "
+                "multiply into one acquisition per (power, pump angle, analyzer angle). "
+                "Run one scan at a time."
             )
-        for name, stage in (("POLARIZATION_P1", self.POLARIZATION_P1),
-                            ("POLARIZATION_HWP", self.POLARIZATION_HWP)):
+
+        analyzer_angles = [float(angle) for angle in self.ELLIPTICITY_ANALYZER_ANGLES]
+        if len(analyzer_angles) < 4:
+            raise ValueError(
+                "ELLIPTICITY_ANALYZER_ANGLES needs at least 4 angles: the sinusoid fitted "
+                "to the analyzer sweep has three free parameters (offset, amplitude, "
+                f"phase), and got {len(analyzer_angles)} point(s). A typical sweep is "
+                "np.arange(0.0, 180.0, 15.0)."
+            )
+        if self.ELLIPTICITY_FIT_PERIOD_DEG <= 0:
+            raise ValueError(
+                "ELLIPTICITY_FIT_PERIOD_DEG must be > 0 (90 deg for a half-wave plate in "
+                f"front of a fixed polarizer), got {self.ELLIPTICITY_FIT_PERIOD_DEG!r}"
+            )
+
+        _reject_duplicate_angle_labels(laser_angles, "ELLIPTICITY_LASER_ANGLES", laser_angle_tag)
+        _reject_duplicate_angle_labels(analyzer_angles, "ELLIPTICITY_ANALYZER_ANGLES",
+                                       analyzer_angle_tag)
+        self.ELLIPTICITY_LASER_ANGLES = laser_angles
+        self.ELLIPTICITY_ANALYZER_ANGLES = analyzer_angles
+
+        if self.ANALYZE_ONLY:
+            return
+        self._validate_pump_power("ELLIPTICITY_LASER_ANGLES")
+        self._validate_pump_stages("ELLIPTICITY_LASER_ANGLES")
+        if self.ELLIPTICITY_ANALYZER_DRY_RUN:
+            return
+        if not self.ELLIPTICITY_ANALYZER_ENABLED:
+            raise ValueError(
+                "An ellipticity scan is configured but ELLIPTICITY_ANALYZER_ENABLED is "
+                "False: every analyzer angle would be recorded with the plate standing "
+                "still, so the sinusoid would be flat for want of motion rather than "
+                "because the emission is circular. Enable the analyzer mount, or set "
+                "ELLIPTICITY_ANALYZER_DRY_RUN=True to rehearse."
+            )
+        if self.ELLIPTICITY_ANALYZER is None or not self.ELLIPTICITY_ANALYZER.serial_number:
+            raise ValueError(
+                "ELLIPTICITY_ANALYZER_ENABLED is True but ELLIPTICITY_ANALYZER has no "
+                "serial number: pass "
+                "ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number=\"...\")."
+            )
+
+    def _validate_pump_power(self, scan_field: str) -> None:
+        if self.PUMP_POWER_SCAN:
+            self._validate_pump_power_scan()
+        elif self.PUMP_POWER <= 0:
+            raise ValueError(
+                f"{scan_field} needs PUMP_POWER: the power every angle is set to, in the "
+                "unit of the calibration table (mW for a power-meter table). For several "
+                "powers in one run, use PUMP_POWER_SCAN instead."
+            )
+
+    def _validate_pump_stages(self, scan_field: str) -> None:
+        if self.PUMP_STAGE_DRY_RUN:
+            return
+        if not self.PUMP_STAGE_ENABLED:
+            raise ValueError(
+                f"{scan_field} is set but PUMP_STAGE_ENABLED is False: every angle would "
+                "be recorded at whatever polarization the pump mounts happen to hold. "
+                "Enable the mounts, or set PUMP_STAGE_DRY_RUN=True."
+            )
+        for name, stage in (("PUMP_P1", self.PUMP_P1), ("PUMP_HWP", self.PUMP_HWP)):
             if stage is None or not stage.serial_number:
                 raise ValueError(
-                    f"POLARIZATION_STAGE_ENABLED is True but {name} has no serial number: "
+                    f"PUMP_STAGE_ENABLED is True but {name} has no serial number: "
                     f"pass {name}=RotationStageConfig(serial_number=\"...\")."
                 )
 
-    def _validate_polarization_power_scan(self) -> None:
-        shape = ('POLARIZATION_POWER_SCAN entries must look like '
+    def _validate_pump_power_scan(self) -> None:
+        shape = ('PUMP_POWER_SCAN entries must look like '
                  '{"power": "50mW", "requested_power": 50.0}')
         seen = set()
-        for entry in self.POLARIZATION_POWER_SCAN:
+        for entry in self.PUMP_POWER_SCAN:
             if not isinstance(entry, dict) or "power" not in entry or "requested_power" not in entry:
                 raise ValueError(f"{shape}, got {entry!r}")
             label = entry["power"]
@@ -259,9 +352,9 @@ class ExperimentConfig:
                 raise ValueError(f"{shape}: 'requested_power' must be > 0, got {value!r}")
             if label in seen:
                 # Two powers sharing a label would write over each other's files.
-                raise ValueError(f"POLARIZATION_POWER_SCAN lists the power label {label!r} twice")
+                raise ValueError(f"PUMP_POWER_SCAN lists the power label {label!r} twice")
             seen.add(label)
-        _reject_nested_labels(sorted(seen), "POLARIZATION_POWER_SCAN")
+        _reject_nested_labels(sorted(seen), "PUMP_POWER_SCAN")
 
     def _validate_stage(self) -> None:
         if self.ANALYZE_ONLY or self.ROTATION_STAGE_DRY_RUN:
@@ -352,88 +445,158 @@ class ExperimentConfig:
         """A copy of this config describing one acquisition of a scan."""
         return replace(self, POWER_LEVEL=power_level, ROTATION_ANGLE_DEG=angle_deg)
 
-    # ---------- Polarization scan ----------
+    # ---------- The pump power, shared by both angle scans ----------
 
-    def is_polarization_scan(self) -> bool:
-        return self.POLARIZATION_SCAN is not None
+    def pump_power_points(self) -> List[Tuple[str, float]]:
+        """[(power label, requested power)] for the acquisition.
 
-    def polarization_scan_points(self) -> List[Tuple[float, str]]:
+        A multi-power run lists them in PUMP_POWER_SCAN; otherwise the single
+        (POWER_LEVEL, PUMP_POWER) pair is the whole scan.
+        """
+        if self.PUMP_POWER_SCAN:
+            return [(str(entry["power"]), float(entry["requested_power"]))
+                    for entry in self.PUMP_POWER_SCAN]
+        return [(self.POWER_LEVEL, float(self.PUMP_POWER))]
+
+    def for_pump_scan_power(self, power: str, requested_power: float) -> "ExperimentConfig":
+        """A copy that records the whole scan at one power of a multi-power run."""
+        return replace(
+            self,
+            POWER_LEVEL=power,
+            POWER_LEVELS=None,
+            PUMP_POWER=float(requested_power),
+            PUMP_BASE_POWER=power,
+            PUMP_POWER_SCAN=None,
+        )
+
+    def for_pump_power(self, power: str) -> "ExperimentConfig":
+        """A copy aimed at one power of a multi-power campaign."""
+        return replace(
+            self,
+            POWER_LEVEL=power,
+            POWER_LEVELS=None,
+            PUMP_BASE_POWER=power,
+            PUMP_POWERS=None,
+        )
+
+    @property
+    def base_power(self) -> str:
+        """The power label of the campaign, whatever POWER_LEVEL was rewritten to."""
+        return self.PUMP_BASE_POWER or self.POWER_LEVEL
+
+    # ---------- Laser angle scan ----------
+
+    def is_laser_angle_scan(self) -> bool:
+        return self.LASER_ANGLE_SCAN is not None
+
+    def laser_angle_scan_points(self) -> List[Tuple[float, str]]:
         """[(angle, file label)] in the configured order; empty without a scan."""
-        if self.POLARIZATION_SCAN is None:
+        if self.LASER_ANGLE_SCAN is None:
             return []
-        return [(float(angle), f"{self.POWER_LEVEL}_{angle_tag(angle)}")
-                for angle in self.POLARIZATION_SCAN]
+        return [(float(angle), f"{self.POWER_LEVEL}_{laser_angle_tag(angle)}")
+                for angle in self.LASER_ANGLE_SCAN]
 
-    def for_polarization(self, angle_deg: float) -> "ExperimentConfig":
-        """A copy of this config describing the acquisition at one angle.
+    def for_laser_angle(self, angle_deg: float) -> "ExperimentConfig":
+        """A copy of this config describing the acquisition at one pump angle.
 
         The angle's file label becomes POWER_LEVEL (so chunk names stay
-        `{power}_polXXX_numN`), while the analysis tree lands under
-        `results/.../polarization/{power}/angles/`.
+        `{power}_lasXXX_numN`), while the analysis tree lands under
+        `results/.../laser_angle/{power}/angles/`.
         """
-        base = self.POLARIZATION_BASE_POWER or self.POWER_LEVEL
-        for angle, label in self.polarization_scan_points():
-            if angle_tag(angle) == angle_tag(angle_deg):
+        base = self.base_power
+        for angle, label in self.laser_angle_scan_points():
+            if laser_angle_tag(angle) == laser_angle_tag(angle_deg):
                 # POWER_LEVELS=None so it is re-derived as [label]: without that, the
                 # step would carry every angle of the scan and analyse all of them.
                 return replace(
                     self,
                     POWER_LEVEL=label,
                     POWER_LEVELS=None,
-                    POLARIZATION_SCAN=None,
-                    POLARIZATION_ANGLE_DEG=angle,
-                    POLARIZATION_BASE_POWER=base,
-                    RESULTS_DIR=self.RESULTS_DIR / "polarization" / base / "angles",
+                    LASER_ANGLE_SCAN=None,
+                    LASER_ANGLE_DEG=angle,
+                    PUMP_BASE_POWER=base,
+                    RESULTS_DIR=self.RESULTS_DIR / "laser_angle" / base / "angles",
                 )
-        raise ValueError(f"{angle_deg} deg is not one of the POLARIZATION_SCAN angles")
+        raise ValueError(f"{angle_deg} deg is not one of the LASER_ANGLE_SCAN angles")
 
-    def polarization_power_points(self) -> List[Tuple[str, float]]:
-        """[(power label, requested power)] for the acquisition.
+    def laser_angle_log_path(self) -> Path:
+        return self.DATA_DIR / SCAN_LOG_NAME
 
-        A multi-power run lists them in POLARIZATION_POWER_SCAN; otherwise the single
-        (POWER_LEVEL, POLARIZATION_POWER) pair is the whole scan.
+    @property
+    def laser_angle_root(self) -> Path:
+        return self.RESULTS_DIR / "laser_angle"
+
+    def laser_angle_summary_dir(self, power: Optional[str] = None) -> Path:
+        """`results/.../laser_angle/{power}/summary/` — the four vs-angle grids."""
+        return self.laser_angle_root / (power or self.base_power) / "summary"
+
+    @property
+    def laser_angle_overlay_dir(self) -> Path:
+        """`results/.../laser_angle/overlay/` — butterflies with every power overlaid."""
+        return self.laser_angle_root / "overlay"
+
+    # ---------- Ellipticity scan ----------
+
+    def is_ellipticity_scan(self) -> bool:
+        return self.ELLIPTICITY_LASER_ANGLES is not None
+
+    def ellipticity_laser_angles(self) -> List[float]:
+        return [float(angle) for angle in (self.ELLIPTICITY_LASER_ANGLES or [])]
+
+    def ellipticity_analyzer_points(self, laser_angle_deg: float) -> List[Tuple[float, str]]:
+        """[(analyzer angle, file label)] of the sweep recorded at one pump angle."""
+        return [(float(analyzer),
+                 f"{self.POWER_LEVEL}_{laser_angle_tag(laser_angle_deg)}"
+                 f"_{analyzer_angle_tag(analyzer)}")
+                for analyzer in self.ELLIPTICITY_ANALYZER_ANGLES]
+
+    def ellipticity_scan_points(self) -> List[Tuple[float, float, str]]:
+        """[(laser angle, analyzer angle, file label)] of the whole scan, in run order."""
+        return [(laser, analyzer, label)
+                for laser in self.ellipticity_laser_angles()
+                for analyzer, label in self.ellipticity_analyzer_points(laser)]
+
+    def for_ellipticity_point(self, laser_angle_deg: float,
+                              analyzer_angle_deg: float) -> "ExperimentConfig":
+        """A copy describing the acquisition at one (pump angle, analyzer angle) pair.
+
+        The pair's file label becomes POWER_LEVEL (chunk names
+        `{power}_lasXXX_hwpYYY_numN`), and the optional per-point analysis tree lands
+        under `results/.../ellipticity/{power}/{laser angle}/points/`.
         """
-        if self.POLARIZATION_POWER_SCAN:
-            return [(str(entry["power"]), float(entry["requested_power"]))
-                    for entry in self.POLARIZATION_POWER_SCAN]
-        return [(self.POWER_LEVEL, float(self.POLARIZATION_POWER))]
-
-    def for_polarization_scan_power(self, power: str, requested_power: float) -> "ExperimentConfig":
-        """A copy that records the whole angle scan at one power of a multi-power run."""
+        base = self.base_power
         return replace(
             self,
-            POWER_LEVEL=power,
+            POWER_LEVEL=f"{base}_{laser_angle_tag(laser_angle_deg)}"
+                        f"_{analyzer_angle_tag(analyzer_angle_deg)}",
             POWER_LEVELS=None,
-            POLARIZATION_POWER=float(requested_power),
-            POLARIZATION_BASE_POWER=power,
-            POLARIZATION_POWER_SCAN=None,
+            ELLIPTICITY_LASER_ANGLES=None,
+            LASER_ANGLE_DEG=float(laser_angle_deg),
+            ANALYZER_ANGLE_DEG=float(analyzer_angle_deg),
+            PUMP_BASE_POWER=base,
+            RESULTS_DIR=self.ellipticity_laser_dir(base, laser_angle_deg) / "points",
         )
 
-    def for_polarization_power(self, power: str) -> "ExperimentConfig":
-        """A copy aimed at one power of a multi-power polarization campaign."""
-        return replace(
-            self,
-            POWER_LEVEL=power,
-            POWER_LEVELS=None,
-            POLARIZATION_BASE_POWER=power,
-            POLARIZATION_POWERS=None,
-        )
-
-    def polarization_log_path(self) -> Path:
-        return self.DATA_DIR / "polarization_scan.csv"
+    def ellipticity_log_path(self) -> Path:
+        return self.DATA_DIR / ELLIPTICITY_LOG_NAME
 
     @property
-    def polarization_root(self) -> Path:
-        return self.RESULTS_DIR / "polarization"
+    def ellipticity_root(self) -> Path:
+        return self.RESULTS_DIR / "ellipticity"
 
-    def polarization_summary_dir(self, power: Optional[str] = None) -> Path:
-        """`results/.../polarization/{power}/summary/` — the three circle-plot grids."""
-        return self.polarization_root / (power or self.POLARIZATION_BASE_POWER or self.POWER_LEVEL) / "summary"
+    def ellipticity_laser_dir(self, power: Optional[str], laser_angle_deg: float) -> Path:
+        """`results/.../ellipticity/{power}/lasXXX/` — one analyzer sweep."""
+        return (self.ellipticity_root / (power or self.base_power)
+                / laser_angle_tag(laser_angle_deg))
+
+    def ellipticity_summary_dir(self, power: Optional[str] = None) -> Path:
+        """`results/.../ellipticity/{power}/summary/` — ellipticity vs laser angle."""
+        return self.ellipticity_root / (power or self.base_power) / "summary"
 
     @property
-    def polarization_overlay_dir(self) -> Path:
-        """`results/.../polarization/overlay/` — butterflies with every power overlaid."""
-        return self.polarization_root / "overlay"
+    def ellipticity_overlay_dir(self) -> Path:
+        """`results/.../ellipticity/overlay/` — every power on the same axes."""
+        return self.ellipticity_root / "overlay"
 
     # ---------- Metadata ----------
 
@@ -441,9 +604,11 @@ class ExperimentConfig:
         params = {"power_level": self.POWER_LEVEL, "chunk": chunk, "duration_s": duration_s}
         if self.ROTATION_ANGLE_DEG is not None:
             params["rotation_angle_deg"] = self.ROTATION_ANGLE_DEG
-        if self.POLARIZATION_ANGLE_DEG is not None:
-            params["polarization_angle_deg"] = self.POLARIZATION_ANGLE_DEG
-            params["requested_power"] = self.POLARIZATION_POWER
+        if self.LASER_ANGLE_DEG is not None:
+            params["laser_angle_deg"] = self.LASER_ANGLE_DEG
+            params["requested_power"] = self.PUMP_POWER
+        if self.ANALYZER_ANGLE_DEG is not None:
+            params["analyzer_angle_deg"] = self.ANALYZER_ANGLE_DEG
         return params
 
 
@@ -456,8 +621,9 @@ class ExperimentConfig:
 # One file per folder, plus one `[run <power>]` section per acquisition.
 #
 # INI so it stays readable by hand and re-parseable by `configparser`, which is how a
-# second run appends itself without losing the previous ones. A polarization scan logs
-# its angles to a CSV of its own (`hardware.ScanLog`) rather than dozens of sections.
+# second run appends itself without losing the previous ones. An angle scan logs its
+# angles to a CSV of its own (`hardware.LaserAngleLog`, `hardware.EllipticityLog`)
+# rather than the dozens of sections one point per angle would add here.
 
 CONFIG_FILENAME = "experiment_config.txt"
 
@@ -465,7 +631,7 @@ Section = Dict[str, str]
 
 # A scan plan describes a procedure, not the setup: extending it or rehearsing it as
 # a dry run is legitimate and must not be reported as a configuration change.
-DRIFT_EXEMPT_SECTIONS = {"power_scan", "polarization_scan"}
+DRIFT_EXEMPT_SECTIONS = {"power_scan", "laser_angle_scan", "ellipticity_scan"}
 
 HEADER = """# HBT experiment configuration
 # Written by src/run_experiment.py - shared by every power level of this folder.
@@ -539,8 +705,10 @@ def _shared_sections(cfg: ExperimentConfig) -> Dict[str, Section]:
     }
     if cfg.is_power_scan():
         sections["power_scan"] = _power_scan_section(cfg)
-    if cfg.is_polarization_scan():
-        sections["polarization_scan"] = _polarization_scan_section(cfg)
+    if cfg.is_laser_angle_scan():
+        sections["laser_angle_scan"] = _laser_angle_scan_section(cfg)
+    if cfg.is_ellipticity_scan():
+        sections["ellipticity_scan"] = _ellipticity_scan_section(cfg)
     return sections
 
 
@@ -556,22 +724,52 @@ def _power_scan_section(cfg: ExperimentConfig) -> Section:
     }
 
 
-def _polarization_scan_section(cfg: ExperimentConfig) -> Section:
-    """The planned polarization scan. Its per-angle record is the CSV log, not the
+def _laser_angle_scan_section(cfg: ExperimentConfig) -> Section:
+    """The planned laser angle scan. Its per-angle record is the CSV log, not the
     dozens of `[run ...]` sections a scan of 36 angles would otherwise add here."""
-    angles = [angle for angle, _label in cfg.polarization_scan_points()]
+    angles = [angle for angle, _label in cfg.laser_angle_scan_points()]
     section: Section = {
         "enabled": _yes_no(True),
         "power_label": cfg.POWER_LEVEL,
-        "requested_power": f"{cfg.POLARIZATION_POWER:g} (calibration unit)",
-        "angles_deg": _angles(angles),
-        "stage_motion": _polarizer_motion(cfg),
-        "p1_serial": (cfg.POLARIZATION_P1.serial_number if cfg.POLARIZATION_P1 else "") or "(none)",
-        "hwp_serial": (cfg.POLARIZATION_HWP.serial_number if cfg.POLARIZATION_HWP else "") or "(none)",
-        "per_angle_log": cfg.polarization_log_path().name,
+        "requested_power": f"{cfg.PUMP_POWER:g} (calibration unit)",
+        "laser_angles_deg": _angles(angles),
+        "per_angle_log": cfg.laser_angle_log_path().name,
     }
-    if cfg.POLARIZATION_CALIBRATION is not None:
-        section["calibration"] = str(cfg.POLARIZATION_CALIBRATION)
+    section.update(_pump_section(cfg))
+    return section
+
+
+def _ellipticity_scan_section(cfg: ExperimentConfig) -> Section:
+    """The planned ellipticity scan: the pump angles, and the analyzer sweep at each."""
+    analyzer = cfg.ELLIPTICITY_ANALYZER
+    section: Section = {
+        "enabled": _yes_no(True),
+        "power_label": cfg.POWER_LEVEL,
+        "requested_power": f"{cfg.PUMP_POWER:g} (calibration unit)",
+        "laser_angles_deg": _angles(cfg.ellipticity_laser_angles()),
+        "analyzer_angles_deg": _angles(cfg.ELLIPTICITY_ANALYZER_ANGLES),
+        "analyzer_serial": (analyzer.serial_number if analyzer else "") or "(none)",
+        "analyzer_motion": _motion(cfg.ELLIPTICITY_ANALYZER_ENABLED,
+                                   cfg.ELLIPTICITY_ANALYZER_DRY_RUN,
+                                   "no (analyzer not turned)"),
+        "fixed_polarizer_deg": f"{cfg.ELLIPTICITY_FIXED_POLARIZER_DEG:g} (0 = vertical)",
+        "fit_period_deg": f"{cfg.ELLIPTICITY_FIT_PERIOD_DEG:g}",
+        "per_angle_log": cfg.ellipticity_log_path().name,
+    }
+    section.update(_pump_section(cfg))
+    return section
+
+
+def _pump_section(cfg: ExperimentConfig) -> Section:
+    """How the pump polarization was set: shared by both angle scans."""
+    section: Section = {
+        "pump_motion": _motion(cfg.PUMP_STAGE_ENABLED, cfg.PUMP_STAGE_DRY_RUN,
+                               "no (polarization not set)"),
+        "pump_p1_serial": (cfg.PUMP_P1.serial_number if cfg.PUMP_P1 else "") or "(none)",
+        "pump_hwp_serial": (cfg.PUMP_HWP.serial_number if cfg.PUMP_HWP else "") or "(none)",
+    }
+    if cfg.PUMP_CALIBRATION is not None:
+        section["pump_calibration"] = str(cfg.PUMP_CALIBRATION)
     return section
 
 
@@ -593,6 +791,10 @@ def _run_section(cfg: ExperimentConfig, result: Any, previous: Section,
     }
     if cfg.ROTATION_ANGLE_DEG is not None:
         section["rotation_angle_deg"] = f"{cfg.ROTATION_ANGLE_DEG:g}"
+    if cfg.LASER_ANGLE_DEG is not None:
+        section["laser_angle_deg"] = f"{cfg.LASER_ANGLE_DEG:g}"
+    if cfg.ANALYZER_ANGLE_DEG is not None:
+        section["analyzer_angle_deg"] = f"{cfg.ANALYZER_ANGLE_DEG:g}"
     if status != "running":
         section["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return section
@@ -648,20 +850,15 @@ def _angles(angles: Any) -> str:
     return ", ".join(f"{v:g}" for v in values)
 
 
-def _polarizer_motion(cfg: ExperimentConfig) -> str:
-    if cfg.POLARIZATION_STAGE_DRY_RUN:
+def _motion(enabled: bool, dry_run: bool, idle: str) -> str:
+    if dry_run:
         return "dry run (angles logged, nothing moved)"
-    if cfg.POLARIZATION_STAGE_ENABLED:
-        return "yes"
-    return "no (polarization not set)"
+    return "yes" if enabled else idle
 
 
 def _stage_motion(cfg: ExperimentConfig) -> str:
-    if cfg.ROTATION_STAGE_DRY_RUN:
-        return "dry run (angles logged, nothing moved)"
-    if cfg.ROTATION_STAGE_ENABLED:
-        return "yes"
-    return "no (angles not applied)"
+    return _motion(cfg.ROTATION_STAGE_ENABLED, cfg.ROTATION_STAGE_DRY_RUN,
+                   "no (angles not applied)")
 
 
 def _stability(cfg: ExperimentConfig) -> str:
@@ -760,23 +957,48 @@ def _warn_on_drift(path: Path, shared: Dict[str, Section]) -> None:
 # PART 3 - naming helpers, shared with the analysis
 # ============================================================================
 
-def angle_tag(angle_deg: float) -> str:
-    """0 -> "pol000p0", 45.5 -> "pol045p5".
+def angle_tag(angle_deg: float, prefix: str) -> str:
+    """0 -> "las000p0", 45.5 -> "las045p5" with prefix "las".
 
     Fixed width, so labels sort by angle and none is a prefix of another - which
-    matters because the analyzer finds a run's files by globbing `*{label}*`.
+    matters because the analyzer finds a run's files by globbing `*{label}_num*`.
     """
     wrapped = wrap_360(angle_deg)
     whole = int(wrapped)
     tenths = int(round((wrapped - whole) * 10))
     if tenths == 10:
         whole, tenths = whole + 1, 0
-    return f"pol{whole % 360:03d}p{tenths}"
+    return f"{prefix}{whole % 360:03d}p{tenths}"
+
+
+def laser_angle_tag(angle_deg: float) -> str:
+    """The pump polarization angle, as it appears in a file name: 45 -> "las045p0"."""
+    return angle_tag(angle_deg, "las")
+
+
+def analyzer_angle_tag(angle_deg: float) -> str:
+    """The analyzer plate angle after the crystal: 15 -> "hwp015p0"."""
+    return angle_tag(angle_deg, "hwp")
 
 
 def harmonic_of(label: str) -> str:
     """"H3T" -> "H3". Same rule as `pkl_json_analyze.is_cross_harmonic`."""
     return "".join(c for c in label if c.isalnum())[:2]
+
+
+def _reject_duplicate_angle_labels(angles: Sequence[float], field_name: str, tagger) -> None:
+    """Refuse angles that would share a file label.
+
+    Labels resolve 0.1 deg, so two angles closer than that would write over each
+    other's files. Checking the labels catches both a repeated and a too-close angle.
+    """
+    labels = [tagger(angle) for angle in angles]
+    duplicates = sorted({label for label in labels if labels.count(label) > 1})
+    if duplicates:
+        raise ValueError(
+            f"{field_name} maps several angles onto the same file label {duplicates}: "
+            "angles must differ by at least 0.1 deg once wrapped into [0, 360)."
+        )
 
 
 def _reject_nested_labels(labels: Sequence[str], field_name: str) -> None:

@@ -65,19 +65,20 @@ HBT_Code/
 │   ├── hardware.py             the Thorlabs mounts, and polarization on top of them
 │   ├── acquisition.py          live tagger acquisition, chunk loop, on-disk schema
 │   ├── pkl_json_analyze.py     the analysis: peaks, g², R, and every figure
-│   ├── config_examples.py      ready-made CONFIG blocks, one per kind of run (§3.7)
+│   ├── config_examples.py      ready-made CONFIG blocks, one per kind of run (§3.8)
 │   └── Polarization_calibration_v20_linear_only.py
 │                               the lab's calibration script — read, never imported
+├── tests/rehearsal/          record and replay a synthetic scan, no hardware (§3.8)
 ├── data/      {MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/…   inputs and recordings
 ├── results/   {MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/…   figures
 ├── polarization_calibration/                          the P1/HWP lookup tables (§3.6)
 └── requirements.txt
 ```
 
-`data/` and `results/` are git-ignored: the repository holds code, the disk holds
-measurements. `polarization_calibration/` is the exception — the lookup tables are
-committed, because every polarization scan reuses one instead of recording its own
-(§3.6).
+`data/`, `results/` and `polarization_calibration/` are git-ignored: the repository holds
+code, the disk holds measurements. The calibration folder is nonetheless long-lived —
+every scan that sets the pump polarization reuses the table already sitting there instead
+of recording its own (§3.6), so it is worth backing up even though git does not carry it.
 
 Dependency direction — nothing ever points back up, so any module can be imported and poked at on its own:
 
@@ -94,9 +95,9 @@ file :
 | Module | Part 1 | Part 2 | Part 3 |
 | --- | --- | --- | --- |
 | `experiment_config.py` | the `ExperimentConfig` dataclass | writing `experiment_config.txt` | naming helpers |
-| `hardware.py` | one Thorlabs rotation mount | linear polarization from the lookup table | – |
+| `hardware.py` | one Thorlabs rotation mount | the pump's polarization from the lookup table | the analyzer after the crystal, and the two scan logs |
 | `acquisition.py` | the live acquisition | the on-disk schema (`build_payload`) | – |
-| `pkl_json_analyze.py` | the per-power analysis and figures | g²(0) and R versus time | the polar summaries versus angle |
+| `pkl_json_analyze.py` | the per-power analysis and figures | g²(0) and R versus time | the vs-angle summaries, then the ellipticity fits |
 
 ---
 
@@ -137,19 +138,29 @@ python src/run_experiment.py        # or
 python -m src.run_experiment        # both work, see §8.5
 ```
 
-Seven useful modes, all selected from `CONFIG`:
+Eight useful modes, all selected from `CONFIG`:
 
 | Goal | `ANALYZE_ONLY` | `RUN_ANALYSIS_AFTER_ACQUIRE` | Needs hardware |
 | --- | --- | --- | --- |
 | Full run : acquire then analyze | `False` | `True` | yes |
 | Acquire now, analyze later | `False` | `False` | yes |
 | Automated power scan (§3.4) | `False` + `POWER_SCAN=[…]` | `True` | yes + one mount |
-| Polarization scan (§3.6) | `False` + `POLARIZATION_SCAN=[…]` | `True` | yes + two mounts |
+| Laser angle scan (§3.6) | `False` + `LASER_ANGLE_SCAN=[…]` | `True` | yes + two mounts |
+| Ellipticity scan (§3.7) | `False` + `ELLIPTICITY_LASER_ANGLES=[…]` | `True` | yes + three mounts |
 | Reprocess existing data | `True` | *(ignored)* | no |
 | Replay a whole power sweep | `True` + `POWER_LEVELS=[…]` | *(ignored)* | no |
-| Multi-power butterflies (§3.6) | `True` + `POLARIZATION_POWERS=[…]` | *(ignored)* | no |
+| Multi-power butterflies (§3.6) | `True` + `PUMP_POWERS=[…]` | *(ignored)* | no |
 
-Copy-paste blocks for each of those live in `src/config_examples.py` (§3.7).
+The two angle scans turn different plates and answer different questions:
+
+| | **Laser angle scan** (§3.6) | **Ellipticity scan** (§3.7) |
+| --- | --- | --- |
+| what turns | P1 + HWP **before** the crystal | a HWP **after** the crystal, in front of a fixed polarizer |
+| what is asked | how the emission depends on the direction the crystal is driven along | how elliptical the emission itself is |
+| one acquisition per | pump angle | (pump angle, analyzer angle) pair |
+| the answer | intensity / g²(0) / R versus pump angle | ellipticity versus pump angle |
+
+Copy-paste blocks for each of those live in `src/config_examples.py` (§3.8).
 
 `matplotlib` is switched to the `Agg` backend at the top of `run_experiment.py`: figures are always written to disk, never shown. The pipeline therefore runs over SSH, in a screen session, or from a scheduler without a display.
 
@@ -230,16 +241,16 @@ Angles are **degrees, absolute, in the controller's own coordinate system**: the
 
 It overrides `ROTATION_STAGE_ENABLED`, so a rehearsal costs one line and no edits to the rest of the block: the scan loop, the configuration file and the angles are all exercised, only the mount stays still (§10.16). `ANALYZE_ONLY=True` skips motion and acquisition entirely.
 
-### 3.6 Polarization scan
+### 3.6 Laser angle scan
 
-The question is how the signal depends on the direction the crystal is driven along, so the polarization must turn while **the power stays constant** — otherwise every curve also carries the intensity dependence. Two mounts do that together:
+The question is how the signal depends on the direction the crystal is driven along, so the **pump** polarization must turn while **the power stays constant** — otherwise every curve also carries the intensity dependence. Two mounts, both **before** the crystal, do that together:
 
-* **P1**, the polarizer, turns to the requested polarization angle;
-* the **half-wave plate** turns to whatever angle delivers the requested power *at that polarization*, read off the lookup table measured beforehand.
+* **P1**, the pump polarizer, turns to the requested laser angle;
+* the pump **half-wave plate** turns to whatever angle delivers the requested power *at that polarization*, read off the lookup table measured beforehand.
 
 There is no optical model anywhere in this. The table is a grid of measured powers over (P1 angle, HWP angle), recorded by the lab's calibration script (`Polarization_calibration_v20_linear_only.py`, menu option `c`), and the pipeline only interpolates it.
 
-**A calibration is recorded once and then reused.** The scan takes hours, so do not repeat it before every campaign: the tables in `polarization_calibration/` are committed with the repository and the defaults already point at `linear_polarization_lookup_latest.npz`, which is the current good one. Recalibrate only when the beam path changes — a new alignment, a swapped wave plate, a moved power meter. The calibration script writes into the same folder, so a freshly recorded table becomes the new `_latest` and is picked up with no config change at all.
+**A calibration is recorded once and then reused.** The scan takes hours, so do not repeat it before every campaign: the defaults already point at `linear_polarization_lookup_latest.npz` in `polarization_calibration/`, which is the current good one. Recalibrate only when the beam path changes — a new alignment, a swapped wave plate, a moved power meter. The calibration script writes into the same folder, so a freshly recorded table becomes the new `_latest` and is picked up with no config change at all.
 
 The pipeline reads the `.npz` that script writes, with the same four keys (`p1_angles`, `hwp_angles`, `power_grid`, `metadata_json`) and the same rule for choosing an HWP angle — the *smallest* one whose interpolated power matches the request.
 
@@ -252,13 +263,13 @@ CONFIG = ExperimentConfig(
     ACQUISITION_DURATION_S=300.0,        # per angle: × 24 angles is the whole scan
     CHUNK_DURATION_S=60.0,
 
-    POLARIZATION_SCAN=np.arange(0.0, 360.0, 15.0),
-    POLARIZATION_POWER=50.0,             # in the table's unit (mW), not a label
-    POLARIZATION_CALIBRATION_DIR=None,   # None → polarization_calibration/, reused as is
-    POLARIZATION_STAGE_ENABLED=True,
-    POLARIZATION_P1=RotationStageConfig(serial_number="27260002", clockwise=True),
-    POLARIZATION_HWP=RotationStageConfig(serial_number="27260003", clockwise=True,
-                                         home_on_connect=True),
+    LASER_ANGLE_SCAN=np.arange(0.0, 360.0, 15.0),
+    PUMP_POWER=50.0,                     # in the table's unit (mW), not a label
+    PUMP_CALIBRATION_DIR=None,           # None → polarization_calibration/, reused as is
+    PUMP_STAGE_ENABLED=True,
+    PUMP_P1=RotationStageConfig(serial_number="27260002", clockwise=True),
+    PUMP_HWP=RotationStageConfig(serial_number="27260003", clockwise=True,
+                                 home_on_connect=True),
 
     RUN_ANALYSIS_AFTER_ACQUIRE=True,
 )
@@ -270,54 +281,139 @@ of the mount you want homed, as above.
 **What one command then does.** Before anything moves, a *preflight* asks the table whether the requested power is reachable at every angle, and says so:
 
 ```
-[pol] lookup: linear_polarization_lookup_latest.npz: 37 P1 angles (0 to 180 deg)
-      x 31 HWP angles (0 to 90 deg), 0 to 100 mW, recorded 2026-07-27T10:15:00
-[pol] preflight: 22/24 angles can deliver 50 mW
+[pump] linear_polarization_lookup_latest.npz: 37 P1 angles (0 to 180 deg)
+       x 31 HWP angles (0 to 90 deg), 0 to 100 mW, recorded 2026-07-27T10:15:00
+[pump] preflight: 22/24 angles can deliver 50 mW
   skipped - 90 deg: 50 mW out of reach (0 to 48 mW)
 ```
 
 Then, per angle: P1 and the HWP move, the settling time passes, the normal acquisition runs, and the angle is written to the per-angle log. Angles the table cannot serve are skipped rather than recorded at the wrong power — a gap in the polar figure is honest, a point at the wrong power is not.
 
-**How the files are named.** Each angle gets a label of its own, the shared power label plus the angle: `50mW_pol000p0`, `50mW_pol015p0`, … `50mW_pol345p0`. Fixed width, so no label is a prefix of another (which would make the analyser's `*{label}*` glob pick up two angles at once) and they sort by angle. Every angle is therefore an ordinary single-power run as far as the rest of the pipeline is concerned: its own chunk files, its own merged file, its own full analysis tree — the latter under `results/…/polarization/50mW/angles/50mW_pol015p0/`.
+**How the files are named.** Each angle gets a label of its own, the shared power label plus the angle: `50mW_las000p0`, `50mW_las015p0`, … `50mW_las345p0` (`las` for *laser angle*). Fixed width, so no label is a prefix of another (which would make the analyser's `*{label}*` glob pick up two angles at once) and they sort by angle. Every angle is therefore an ordinary single-power run as far as the rest of the pipeline is concerned: its own chunk files, its own merged file, and — if you ask for it — its own full analysis tree under `results/…/laser_angle/50mW/angles/50mW_las015p0/`.
 
 **Angle conventions**, which have to match the calibration script or the table means
 nothing:
 
-* an angle is a **polarization direction**, 0° = vertical in P1's frame;
+* a laser angle is a **polarization direction**, 0° = vertical in P1's frame;
 * mounts receive `(sign × angle) mod 360`, the sign from `clockwise` — the calibration script uses clockwise on both mounts, and so     must the config;
 * the table covers P1 over `[0, 180)` because a linear polarization repeats every 180°, so 190° reuses the HWP setting measured at 10°. The scan itself still runs the full 0–360°: the two halves are an independent measurement of the same physics, and their disagreement is a useful check on drift.
 
-**The summary figures**, written to `results/…/polarization/{POWER}/summary/`, are the point of the exercise. Every point is the mean over that angle's chunks, and the shaded band is their standard deviation — the same chunk-to-chunk spread the per-power figures use as an error bar:
+**The summary figures**, written to `results/…/laser_angle/{POWER}/summary/`, are the point of the exercise. Every point is the mean over that angle's chunks, and the shaded band is their standard deviation — the same chunk-to-chunk spread the per-power figures use as an error bar:
 
-| Figure | One polar panel per | Shows |
+| Figure | One row/panel per | Shows |
 | --- | --- | --- |
-| `intensity_vs_angle.png` | channel | count rate (counts/s) |
-| `g2_vs_angle.png` | pair | g²(0), green for auto pairs, red for cross pairs, dashed unit circle |
+| `intensity_vs_angle.png` | harmonic | count rate: polar on top, the same curves on linear axes below, with the interpolated minima marked |
+| `g2_vs_angle.png` | harmonic | its auto pair first, then that harmonic's whole cross family |
+| `R_vs_angle.png` | cross family | R, dashed unit circle |
 | `harmonics_vs_angle.png` | harmonic | a 2×N grid: the harmonic's total signal on top, its auto-g²(0) directly below |
 
 g²(0) on these figures is the **integration** estimator only — the counts-based one is not comparable across angles while `Np` is hard-coded (§11.1).
 
-`polarization_summary.csv` next to them holds the same numbers as text, and `data/…/polarization_scan.csv` records what each angle was actually set to (§6.4). The polar plots turn in the same direction as the mounts, so a lobe on the figure points where the polarizer pointed.
+`interpolated_minima.csv` next to them holds the angle of each intensity minimum, and `data/…/laser_angle_scan.csv` records what each angle was actually set to (§6.4). The polar plots turn in the same direction as the mounts, so a lobe on the figure points where the polarizer pointed.
 
-**Several powers: the butterfly overlay.** Record one scan per power *in the same `DATE` folder*, changing `POWER_LEVEL` and `POLARIZATION_POWER` between runs, then replay the folder with the powers listed:
+**The per-angle trees are off by default.** Analysing 24 angles means 24 full HBT trees at dpi 700, which takes far longer than the scan's own summaries and is rarely the first thing you look at. Set `LASER_ANGLE_PLOT_ANGLES=True` to draw them as well (§11.9).
+
+**Several powers: the butterfly overlay.** Either record one scan per power in one command, by listing the powers instead of setting one:
+
+```python
+PUMP_POWER_SCAN=[
+    {"power": "25mW", "requested_power": 25.0},
+    {"power": "45mW", "requested_power": 45.0},
+    {"power": "65mW", "requested_power": 65.0},
+],
+```
+
+which opens the two mounts once and drives the whole angle scan at each power in turn, drawing that power's summary the moment its scan finishes — so a campaign that is interrupted at the third power keeps the figures of the first two. Or record them one run at a time in the same `DATE` folder, changing `POWER_LEVEL` and `PUMP_POWER` between runs, then replay the folder with the powers listed:
 
 ```python
 ANALYZE_ONLY=True,
-POLARIZATION_SCAN=np.arange(0.0, 360.0, 15.0),
-POLARIZATION_POWERS=["25mW", "45mW", "65mW"],
+LASER_ANGLE_SCAN=np.arange(0.0, 360.0, 15.0),
+PUMP_POWERS=["25mW", "45mW", "65mW"],
 ```
 
-That rebuilds each power's three summaries and then redraws the same three layouts with every power as a coloured curve on each panel, under `results/…/polarization/overlay/`. Leaving `POLARIZATION_POWERS=None` makes the pipeline discover the powers from the file names instead, which is what happens automatically at the end of an acquisition. With a single power the overlay is skipped and says so.
+Either way the four layouts are redrawn with every power as a coloured curve on each panel, under `results/…/laser_angle/overlay/`. Leaving `PUMP_POWERS=None` makes the pipeline discover the powers from the file names instead, which is what happens automatically at the end of an acquisition. With a single power the overlay is skipped and says so.
 
 The full result tree is in §6.5.
 
-### 3.7 Ready-made configs
+### 3.7 Ellipticity scan
+
+The laser angle scan asks what the crystal emits; this one asks **how that emission is polarized**. A half-wave plate is added *after* the crystal, in front of a polarizer that never moves. Turning the plate by θ turns the harmonic polarization by 2θ, so what the polarizer transmits traces a sinusoid of period **90°** in plate angle, and the depth of that sinusoid is the whole measurement:
+
+* a curve that reaches **zero** — one axis of the ellipse carries nothing — is a **linear** polarization;
+* a **flat** curve — both axes carry the same — is a **circular** one.
+
+Written with the fitted offset $I_0$ and amplitude $A$, the modulation is $m = A/I_0$, the two intensities the fit reaches are $I_{max} = I_0 + A$ and $I_{min} = I_0 - A$, and
+
+$$
+\text{attenuation} = \frac{I_{min}}{I_{max}} = \frac{1-m}{1+m}, \qquad
+\epsilon = \sqrt{\text{attenuation}}
+$$
+
+so ε = 0 is linear and ε = 1 is circular. Repeating that sweep at several pump angles is what gives **ellipticity versus laser angle**, which is the point of the scan.
+
+```python
+CONFIG = ExperimentConfig(
+    MATERIAL="ZnO100",
+    EXPERIENCE_TYPE="David_Setup",
+    DATE="30072026",
+    POWER_LEVEL="50mW",                  # the label every point of the scan shares
+    ACQUISITION_DURATION_S=120.0,        # per POINT: × 3 × 12 is the whole scan
+    CHUNK_DURATION_S=30.0,
+
+    PUMP_POWER=50.0,                     # in the table's unit, as in §3.6
+    PUMP_STAGE_ENABLED=True,
+    PUMP_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
+    PUMP_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
+
+    ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],                 # the outer loop
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),    # the inner loop
+    ELLIPTICITY_ANALYZER_ENABLED=True,
+    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
+
+    RUN_ANALYSIS_AFTER_ACQUIRE=True,
+)
+```
+
+Three mounts, then: the two pump mounts of §3.6 — the pump polarization is set exactly the same way, from the same lookup table, and unreachable pump angles are skipped by the same preflight — plus the analyzer plate. **The analyzer needs no calibration**: its angle *is* the requested angle, because the measurement is the shape of the transmitted curve, not its absolute level.
+
+**What one command then does.** The loops are nested power → laser angle → analyzer angle, and the pump is set once per laser angle while the analyzer turns through its whole sweep there. That is both the quickest order (the pump mounts move three times, the analyzer thirty-six) and the one that keeps a sweep internally consistent: every point of a fit was taken at the same pump setting.
+
+```
+########## laser angle 2/3: 45 deg ##########
+[pump] 45 deg: P1 45 deg, HWP 24.8112 deg for 50 mW
+
+===== analyzer 1/12: 0 deg (50mW_las045p0_hwp000p0) =====
+[analyzer] plate to 0 deg
+  chunk 1/4 -> 50mW_las045p0_hwp000p0_num1.pkl
+  …
+```
+
+**How the files are named.** Each point carries both angles: `50mW_las045p0_hwp000p0`, `50mW_las045p0_hwp015p0`, … Same fixed-width rule as §3.6, and the `hwp` half is what distinguishes an ellipticity point from a laser angle scan's `50mW_las045p0` — so both scans can share a `DATE` folder without their files being confused for one another.
+
+**Per sweep**, under `results/…/ellipticity/{POWER}/las045p0/`, you get the same four vs-angle figures as a laser angle scan, drawn against **analyzer** angle, with the fitted sinusoid overlaid on the linear intensity panels and `sinusoidal_fit.csv` holding every fitted parameter (per harmonic, and per channel as a cross-check).
+
+**Per power**, under `results/…/ellipticity/{POWER}/summary/`:
+
+| Figure | Shows |
+| --- | --- |
+| `ellipticity_vs_laser_angle.png` | ε per harmonic against pump angle, with the fit's error bars and guides at 0 (linear) and 1 (circular), and the same curve on the pump's circle beside it — **the result of the scan** |
+| `modulation_vs_laser_angle.png` | the *m* those ε were derived from, same layout |
+| `sinusoid_fits_{harmonic}.png` | every analyzer sweep of that harmonic and its fit, side by side, so a bad fit is visible rather than averaged in |
+| `ellipticity_vs_laser_angle.csv` | ε, *m*, attenuation, R² and the mean intensity per (laser angle, harmonic) |
+
+The fit itself holds the period at the 90° a half-wave plate imposes, which leaves three linear parameters (offset, amplitude, phase) and makes it an ordinary least-squares solve — it cannot fail to converge on a nearly flat curve, which is exactly the interesting case. Uncertainties are the usual residual-based ones, propagated from the fit into *m* and then into ε. A sweep with fewer than four analyzer angles carrying data is skipped rather than fitted.
+
+Several powers work exactly as in §3.6 — `PUMP_POWER_SCAN` to record them in one command, `PUMP_POWERS` to replay them — and put ε and *m* for every power on the same axes under `results/…/ellipticity/overlay/`. As with the laser angle scan, the heavy per-point HBT trees are off unless `ELLIPTICITY_PLOT_POINTS=True`: there is one per (laser angle, analyzer angle) pair, so a 3 × 12 scan would render 36 of them.
+
+The full result tree is in §6.6.
+
+### 3.8 Ready-made configs
 
 `src/config_examples.py` holds one complete `CONFIG` per kind of run — single power,
-power scan, polarization scan, multi-power overlay, analysis only — aimed at the real
-folders and the real serial numbers. Running it builds every one of them, so a typo or
-an impossible combination shows up in a second rather than at the start of a six-hour
-scan:
+power scan, laser angle scan, ellipticity scan, multi-power overlay, analysis only —
+aimed at the real folders and the real serial numbers. Running it builds every one of
+them, so a typo or an impossible combination shows up in a second rather than at the
+start of a six-hour scan:
 
 ```bash
 python src/config_examples.py
@@ -330,6 +426,30 @@ want between `CONFIG = ExperimentConfig(` and `)`.
 Nothing there touches hardware: building an `ExperimentConfig` only runs the validation
 of §4.8. Before a session, that plus a dry run of the mounts (§3.5, §10.16) is the
 cheapest way to find a mistake while it still costs a second.
+
+`tests/rehearsal/` is the other half of that, and it needs no beam either:
+
+```bash
+python tests/rehearsal/make_data.py         # record both angle scans, against a mock source
+python tests/rehearsal/replay_check.py      # replay them through the analysis
+```
+
+`make_data.py` runs the **real** acquisition loops — dry-run mounts, the real labels,
+CSV logs and `experiment_config.txt` — with only the tagger replaced by a synthetic
+source whose brightness and polarization are known functions of the pump angle. It notes
+the ellipticity it injected at each angle; `replay_check.py` then analyses the files and
+prints the fitted ellipticity beside the injected one, exiting non-zero if any harmonic
+is off:
+
+```
+   power  laser angle  harmonic   fitted  injected    error
+    50mW            0        H3   0.0000    0.0000   0.0000
+    50mW           45        H3   0.7078    0.7071   0.0007
+    50mW           90        H3   0.9979    1.0000   0.0021
+```
+
+So the two commands together check the orchestration, the file naming, the fit and every
+figure — which is most of what can go wrong that is not the hardware itself.
 
 ---
 
@@ -434,7 +554,7 @@ Choose the interval so that `ACQUISITION_DURATION_S / interval` is comfortably l
 
 `ROTATION_ANGLE_DEG` is normally set by the scan loop, one step at a time, and ends up in the run's section and in each data file's `Parameters`. Setting it by hand together with `ROTATION_STAGE_ENABLED=True` and no `POWER_SCAN` is the single-point case: move once, then record one power level.
 
-`RotationStageConfig` (in `src/hardware.py`) describes the mount itself, and the same dataclass is used for the two mounts of a polarization scan:
+`RotationStageConfig` (in `src/hardware.py`) describes the mount itself, and the same dataclass is used for the two pump mounts and for the analyzer plate of the angle scans:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -456,34 +576,67 @@ A move is commanded and then **polled**: `move_to_angle_deg` returns once the po
 
 `clockwise` must match the mount the calibration was taken on: with `False`, 15° is sent to the controller as 345°. Angles are wrapped into `[0, 360)` and compared the short way round, so a move from 359° to 1° arrives instead of timing out at the seam.
 
-### 4.7 Polarization scan
+### 4.7 The pump mounts, and the two angle scans
+
+The `PUMP_*` fields describe P1 and the half-wave plate **before** the crystal. They set
+the pump's polarization the same way whichever angle scan is running, which is why they
+are shared rather than duplicated:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `POLARIZATION_SCAN` | `None` | the angles to record, e.g. `np.arange(0, 360, 15)` |
-| `POLARIZATION_POWER` | `0.0` | power held at every angle, in the **table's unit** |
-| `POLARIZATION_POWERS` | `None` | analysis only: the powers to summarise and overlay |
-| `POLARIZATION_CALIBRATION` | `None` | a specific lookup file; `None` → `linear_polarization_lookup_latest.npz` in the folder below, else the newest table there |
-| `POLARIZATION_CALIBRATION_DIR` | `None` → `polarization_calibration/` | where the reused tables live |
-| `POLARIZATION_STAGE_ENABLED` | `False` | actually move P1 and the HWP |
-| `POLARIZATION_STAGE_DRY_RUN` | `False` | log the moves, import nothing, move nothing |
-| `POLARIZATION_P1` | `None` | `RotationStageConfig` of the polarizer |
-| `POLARIZATION_HWP` | `None` | `RotationStageConfig` of the half-wave plate |
-| `POLARIZATION_SETTLE_TIME_S` | `0.2` | extra pause after both mounts have arrived |
-| `POLARIZATION_ANGLE_DEG` | `None` | the angle of **this** acquisition, set by the loop |
-| `POLARIZATION_BASE_POWER` | `None` | the power label of **this** acquisition, set by the loop |
+| `PUMP_POWER` | `0.0` | power held at every angle, in the **table's unit** |
+| `PUMP_POWER_SCAN` | `None` | record the whole scan at each of several powers in one run: `[{"power": "50mW", "requested_power": 50.0}, …]` |
+| `PUMP_POWERS` | `None` | analysis only: the powers to summarise and overlay |
+| `PUMP_CALIBRATION` | `None` | a specific lookup file; `None` → `linear_polarization_lookup_latest.npz` in the folder below, else the newest table there |
+| `PUMP_CALIBRATION_DIR` | `None` → `polarization_calibration/` | where the reused tables live |
+| `PUMP_STAGE_ENABLED` | `False` | actually move P1 and the HWP |
+| `PUMP_STAGE_DRY_RUN` | `False` | log the moves, import nothing, move nothing |
+| `PUMP_P1` | `None` | `RotationStageConfig` of the pump polarizer |
+| `PUMP_HWP` | `None` | `RotationStageConfig` of the pump half-wave plate |
+| `PUMP_SETTLE_TIME_S` | `0.2` | extra pause after both mounts have arrived |
+| `PUMP_BASE_POWER` | `None` | the power label of **this** acquisition, set by the loop |
 
-`POLARIZATION_POWER` is a **number in the calibration's unit** (mW for a power-meter
-table), not a label like `"50mW"`: it is looked up in the table. `POWER_LEVEL` remains
-the label that names the files, shared by every angle of the scan.
+`PUMP_POWER` is a **number in the calibration's unit** (mW for a power-meter table), not
+a label like `"50mW"`: it is looked up in the table. `POWER_LEVEL` remains the label that
+names the files, shared by every point of the scan.
 
-The last two fields are bookkeeping the scan loop fills in, not knobs. While one angle
-is being recorded, `POWER_LEVEL` *is* that angle's label (`50mW_pol015p0`), so
-`POLARIZATION_BASE_POWER` is what remembers that the campaign is called `50mW` — which
-is how the results of every angle end up under the same power folder.
+`PUMP_BASE_POWER` is bookkeeping the scan loop fills in, not a knob. While one point is
+being recorded, `POWER_LEVEL` *is* that point's label (`50mW_las015p0`), so
+`PUMP_BASE_POWER` is what remembers that the campaign is called `50mW` — which is how the
+results of every point end up under the same power folder.
 
-`POLARIZATION_POWERS` is the multi-power replay of §3.6: it names the power labels
-already recorded in the folder, and it is the only field the butterfly overlay needs.
+`PUMP_POWER_SCAN` and `PUMP_POWERS` are the two halves of a multi-power campaign: the
+first records it, the second replays powers already in the folder. Both work for either
+angle scan.
+
+**The laser angle scan** (§3.6) then needs only which pump angles to record:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `LASER_ANGLE_SCAN` | `None` | the pump angles to record, e.g. `np.arange(0, 360, 15)` |
+| `LASER_ANGLE_DEG` | `None` | the pump angle of **this** acquisition, set by the loop |
+| `LASER_ANGLE_PLOT_ANGLES` | `False` | also draw the full HBT tree of every angle |
+
+**The ellipticity scan** (§3.7) adds the analyzer plate after the crystal, and a sweep of
+it at each pump angle:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `ELLIPTICITY_LASER_ANGLES` | `None` | the pump angles: the outer loop, and the x axis of the result |
+| `ELLIPTICITY_ANALYZER_ANGLES` | `np.arange(0, 180, 15)` | the plate angles swept at each of them: the inner loop |
+| `ELLIPTICITY_ANALYZER` | `None` | `RotationStageConfig` of the plate after the crystal |
+| `ELLIPTICITY_ANALYZER_ENABLED` | `False` | actually turn that plate |
+| `ELLIPTICITY_ANALYZER_DRY_RUN` | `False` | log the moves, import nothing, move nothing |
+| `ELLIPTICITY_ANALYZER_SETTLE_TIME_S` | `0.2` | extra pause after the plate has arrived |
+| `ELLIPTICITY_FIT_PERIOD_DEG` | `90.0` | the period the sinusoid is held at; 90° for a HWP |
+| `ELLIPTICITY_FIXED_POLARIZER_DEG` | `0.0` | metadata only: the fixed polarizer, 0 = vertical |
+| `ANALYZER_ANGLE_DEG` | `None` | the plate angle of **this** acquisition, set by the loop |
+| `ELLIPTICITY_PLOT_POINTS` | `False` | also draw the full HBT tree of every point |
+
+Setting `ELLIPTICITY_LASER_ANGLES` is what selects the scan; the analyzer angles have a
+usable default because the 0–180° sweep is the normal one. `ELLIPTICITY_FIT_PERIOD_DEG`
+is a property of the optic, not a fitting preference: change it only if the analyzer is
+not a half-wave plate.
 
 ### 4.8 Validation and derived values
 
@@ -500,20 +653,29 @@ and four ways of getting a power scan wrong.
 | `POWER_SCAN` while the stage is disabled | every power would be recorded at one angle |
 | `ROTATION_STAGE_ENABLED` with no serial number | nothing to connect to |
 
-and five ways of getting a polarization scan wrong:
+then the ways of getting an angle scan wrong. Common to both:
 
 | Situation | Why it is refused |
 | --- | --- |
-| `POWER_SCAN` and `POLARIZATION_SCAN` together | that is one acquisition per (power, angle): run one scan at a time |
+| `POWER_SCAN` and either angle scan together | that is one acquisition per (power, angle) pair: run one scan at a time, and use `PUMP_POWER_SCAN` for several powers |
+| `LASER_ANGLE_SCAN` and `ELLIPTICITY_LASER_ANGLES` together | the first records one acquisition per pump angle, the second a whole analyzer sweep at each: run one at a time |
 | two angles closer than 0.1° once wrapped | they would share a file label, hence their files |
-| `POLARIZATION_SCAN` without `POLARIZATION_POWER` | there would be nothing to look up in the table |
-| `POLARIZATION_SCAN` while the mounts are disabled | every angle would be recorded at whatever polarization the mounts happen to hold |
-| a mount enabled with no serial number | nothing to connect to |
-| `POLARIZATION_POWERS` with one label inside another | same glob ambiguity as above |
+| a scan without `PUMP_POWER` (or `PUMP_POWER_SCAN`) | there would be nothing to look up in the table |
+| a scan while the pump mounts are disabled | every angle would be recorded at whatever polarization the mounts happen to hold |
+| `PUMP_P1` or `PUMP_HWP` enabled with no serial number | nothing to connect to |
+| `PUMP_POWERS` or `PUMP_POWER_SCAN` with one label inside another | same glob ambiguity as above |
+
+and three specific to the ellipticity scan:
+
+| Situation | Why it is refused |
+| --- | --- |
+| fewer than four `ELLIPTICITY_ANALYZER_ANGLES` | the sinusoid has three free parameters, so three points cannot be fitted |
+| `ELLIPTICITY_FIT_PERIOD_DEG` not positive | there would be no period to hold the fit at |
+| the analyzer disabled, or enabled with no serial number | every analyzer angle would be recorded with the plate standing still, so the sinusoid would come out flat for want of motion rather than because the emission is circular |
 
 The hardware checks are skipped when `ANALYZE_ONLY=True` (reprocessing never moves
 anything) or when the matching `*_DRY_RUN` is set (an explicit "I know there is no
-hardware"). When either scan is configured, `POWER_LEVELS` is **derived from it**, in
+hardware"). When any scan is configured, `POWER_LEVELS` is **derived from it**, in
 order, so the analysis covers exactly the points that were recorded.
 
 Everything else is computed on demand:
@@ -531,14 +693,27 @@ Everything else is computed on demand:
 | `is_power_scan()` | `True` when `POWER_SCAN` holds at least one point |
 | `power_scan_points()` | `[("25mW", 8.0), …]` in the configured order |
 | `for_power(power, angle)` | a copy of the config describing one point of the scan |
-| `is_polarization_scan()` | `True` when `POLARIZATION_SCAN` is set |
-| `polarization_scan_points()` | `[(0.0, "50mW_pol000p0"), …]` in the configured order |
-| `for_polarization(angle)` | a copy describing one angle, with its label as `POWER_LEVEL` |
-| `for_polarization_power(power)` | a copy aimed at one power of a multi-power campaign |
-| `polarization_log_path()` | `DATA_DIR/polarization_scan.csv` |
-| `polarization_root` | `RESULTS_DIR/polarization` |
-| `polarization_summary_dir(power)` | `RESULTS_DIR/polarization/{power}/summary` |
-| `polarization_overlay_dir` | `RESULTS_DIR/polarization/overlay` |
+| `pump_power_points()` | `[("50mW", 50.0), …]`: `PUMP_POWER_SCAN`, else the single pair |
+| `for_pump_scan_power(power, req)` | a copy recording the whole scan at one power |
+| `for_pump_power(power)` | a copy aimed at one power of a multi-power campaign |
+| `base_power` | the campaign's power label, whatever `POWER_LEVEL` was rewritten to |
+| `is_laser_angle_scan()` | `True` when `LASER_ANGLE_SCAN` is set |
+| `laser_angle_scan_points()` | `[(0.0, "50mW_las000p0"), …]` in the configured order |
+| `for_laser_angle(angle)` | a copy describing one angle, with its label as `POWER_LEVEL` |
+| `laser_angle_log_path()` | `DATA_DIR/laser_angle_scan.csv` |
+| `laser_angle_root` | `RESULTS_DIR/laser_angle` |
+| `laser_angle_summary_dir(power)` | `RESULTS_DIR/laser_angle/{power}/summary` |
+| `laser_angle_overlay_dir` | `RESULTS_DIR/laser_angle/overlay` |
+| `is_ellipticity_scan()` | `True` when `ELLIPTICITY_LASER_ANGLES` is set |
+| `ellipticity_laser_angles()` | the pump angles of the outer loop |
+| `ellipticity_analyzer_points(la)` | `[(0.0, "50mW_las045p0_hwp000p0"), …]`: one sweep |
+| `ellipticity_scan_points()` | `[(laser, analyzer, label), …]` of the whole scan, in run order |
+| `for_ellipticity_point(la, aa)` | a copy describing one (pump, analyzer) pair |
+| `ellipticity_log_path()` | `DATA_DIR/ellipticity_scan.csv` |
+| `ellipticity_root` | `RESULTS_DIR/ellipticity` |
+| `ellipticity_laser_dir(power, la)` | `RESULTS_DIR/ellipticity/{power}/las045p0` — one sweep |
+| `ellipticity_summary_dir(power)` | `RESULTS_DIR/ellipticity/{power}/summary` |
+| `ellipticity_overlay_dir` | `RESULTS_DIR/ellipticity/overlay` |
 | `active_harmonics()` | `{"H3": (1, 5), "H5": (10, 14)}` — complete harmonics only |
 | `active_channels()` | flattened channels of the complete harmonics |
 | `correlation_pairs()` | every unordered pair of those, always `ch1 < ch2` |
@@ -603,13 +778,21 @@ scan changed no behaviour for a single-power run. `run_analysis(cfg)` is called 
 either way: with a scan, `POWER_LEVELS` already holds every point, so the sweep figures
 come out of the same pass.
 
-A **polarization scan** replaces the middle of that diagram with its own loop
-(`acquire_polarization_scan`): the preflight first, then per angle P1 and the HWP move,
+A **laser angle scan** replaces the middle of that diagram with its own loop
+(`acquire_laser_angle_scan`): the preflight first, then per angle P1 and the HWP move,
 the same `run_acquisition` records the angle's label as if it were a power level, and
 the angle is written to the CSV log instead of a `[run …]` section. Its analysis differs
-too: `run_analysis` is called once **per angle** — each angle is one acquisition, and a
-single pass over 24 of them would build a 24-point "power sweep" out of angles — and
-the polar summaries and the overlay come after (§3.6).
+too: the vs-angle summaries are drawn per power as soon as that power's scan finishes,
+then the overlay once every power is on disk (§3.6). The per-angle trees, when asked
+for, are `run_analysis` called once **per angle** — each angle is one acquisition, and a
+single pass over 24 of them would build a 24-point "power sweep" out of angles.
+
+An **ellipticity scan** (`acquire_ellipticity_scan`) is the same shape with one more
+loop inside it: the pump is set once per laser angle, the analyzer plate then turns
+through its whole sweep there, and each (pump, analyzer) pair is one ordinary
+acquisition. All three mounts are opened once for the run and released by `with`
+whatever raises. Its analysis fits every sweep and draws ellipticity versus laser angle
+(§3.7).
 
 On the `ANALYZE_ONLY` branch the configuration file is written only if the folder does
 not have one yet. A replay config usually carries the analysis fields and not the optics
@@ -702,7 +885,8 @@ results/{MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/
     65mW/power_summary/…           chunk-averaged figures
     65mW/stability/…               stability figures + snapshots
     power_sweep_summary/…          only when several powers are analysed
-    polarization/…                 only for a polarization scan (§6.5)
+    laser_angle/…                  only for a laser angle scan (§6.5)
+    ellipticity/…                  only for an ellipticity scan (§6.6)
 ```
 
 The name of a figure folder is the analyzer's key for the file it was drawn from
@@ -718,7 +902,10 @@ Both `.pkl` and `.json` hold the same dict. This schema is dictated by
 ```python
 {
   "Parameters": {"power_level": "65mW", "chunk": 1, "duration_s": 60.0,
-                 "rotation_angle_deg": 8.0},   # only when an angle was used
+                 "rotation_angle_deg": 8.0,      # only when the power stage was used
+                 "laser_angle_deg": 45.0,        # only in an angle scan
+                 "requested_power": 50.0,        #   idem, in the calibration's unit
+                 "analyzer_angle_deg": 15.0},    # only in an ellipticity scan
 
   "Correlation": {
       "(1, 5)":  [[-301200, -300900, …], [3, 3, 2, 4, …]],   # delays in ps, counts
@@ -746,8 +933,8 @@ Details that matter:
   `.json` byte-for-byte equivalent in content.
 * **`Parameters` deliberately holds almost nothing** — only what makes this file
   differ from its neighbours: its power level, its chunk number, how long it lasted,
-  and the stage angle when one was used. The analyzer ignores the key entirely; it is
-  there so a file found on its own can still be identified.
+  and whichever angles were set. The analyzer ignores the key entirely; it is there so
+  a file found on its own can still be identified.
 
 ### 6.2 `experiment_config.txt`
 
@@ -824,10 +1011,30 @@ finished           = 2026-07-27 15:26:31
   `started` is preserved across the update. A power point that raised is rewritten as
   `status = failed`, keeping the numbers it was *asked* for.
 * `rotation_angle_deg` appears whenever an angle was used, so a folder of runs is also
-  the record of the calibration the scan was based on.
+  the record of the calibration the scan was based on. `laser_angle_deg` and
+  `analyzer_angle_deg` appear the same way for the angle scans.
 * `[power_scan]` describes the scan as configured, including whether the stage really
   moved (`stage_motion = dry run (angles logged, nothing moved)` after a rehearsal).
-  It only appears when `POWER_SCAN` is set.
+  It only appears when `POWER_SCAN` is set. `[laser_angle_scan]` and
+  `[ellipticity_scan]` do the same for the angle scans, and add how the pump
+  polarization was set:
+
+  ```ini
+  [ellipticity_scan]
+  enabled             = yes
+  power_label         = 50mW
+  requested_power     = 50 (calibration unit)
+  laser_angles_deg    = 0 to 90 step 45 (3 points)
+  analyzer_angles_deg = 0 to 165 step 15 (12 points)
+  analyzer_serial     = 27270568
+  analyzer_motion     = yes
+  fixed_polarizer_deg = 0 (0 = vertical)
+  fit_period_deg      = 90
+  per_angle_log       = ellipticity_scan.csv
+  pump_motion         = yes
+  pump_p1_serial      = 27270550
+  pump_hwp_serial     = 27270567
+  ```
 * `ANALYZE_ONLY` writes the shared sections only, and only when the folder has no
   configuration file yet — reprocessing never invents a run that did not happen, and
   never overwrites the record of one that did.
@@ -841,10 +1048,10 @@ finished           = 2026-07-27 15:26:31
     DATE / EXPERIENCE_TYPE folder.
   ```
 
-  `[power_scan]` and `[polarization_scan]` are exempt from that check: extending a
-  scan, reordering it or rehearsing it as a dry run are all legitimate, and each
-  point already records the angle it was taken at — in its own section for a power
-  scan, in the CSV log for a polarization scan (§6.4).
+  `[power_scan]`, `[laser_angle_scan]` and `[ellipticity_scan]` are exempt from that
+  check: extending a scan, reordering it or rehearsing it as a dry run are all
+  legitimate, and each point already records the angle it was taken at — in its own
+  section for a power scan, in the CSV log for an angle scan (§6.4).
 * Reprocessing (`ANALYZE_ONLY=True`) rewrites nothing at all when the file exists, so
   a replay config that only carries the analysis fields cannot erase the record of the
   run (§5).
@@ -863,48 +1070,104 @@ Keys of `hist` are `(chA, chB)` integer tuples — not the strings used in the d
 files. Reload it with `acquisition.load_snapshots(path)` and feed it straight back to
 `pkl_json_analyze.plot_stability(snapshots, cfg)` to redraw without measuring again.
 
-### 6.4 `polarization_scan.csv`
+### 6.4 The scan logs, `laser_angle_scan.csv` and `ellipticity_scan.csv`
 
-A polarization scan is dozens of acquisitions, so its per-angle record is one table
-rather than dozens of `[run …]` sections. It lives next to the data, in
-`data/…/polarization_scan.csv`, one row per angle:
+An angle scan is dozens of acquisitions, so its per-point record is one table rather
+than dozens of `[run …]` sections. It lives next to the data, one row per point.
 
 ```csv
-polarization_angle_deg,power_label,requested_power,unit,p1_angle_deg,hwp_angle_deg,reachable_min,reachable_max,status,chunks,duration_s,recorded_at,note
-0,50mW_pol000p0,50,mW,0,25.4006,0,100,complete,5,300,2026-07-27 15:16:27,
-15,50mW_pol015p0,50,mW,15,24.8112,0,98,complete,5,300,2026-07-27 15:22:04,
-90,50mW_pol090p0,50,mW,,,0,48,unreachable,,,2026-07-27 15:27:41,
+laser_angle_deg,power_label,requested_power,unit,p1_angle_deg,hwp_angle_deg,reachable_min,reachable_max,status,chunks,duration_s,recorded_at,note
+0,50mW_las000p0,50,mW,0,25.4006,0,100,complete,5,300,2026-07-27 15:16:27,
+15,50mW_las015p0,50,mW,15,24.8112,0,98,complete,5,300,2026-07-27 15:22:04,
+90,50mW_las090p0,50,mW,,,0,48,unreachable,,,2026-07-27 15:27:41,
 ```
 
-* `p1_angle_deg` and `hwp_angle_deg` are what the mounts were **actually set to**, read
-  off the lookup table — the record of the calibration this scan relied on.
+* `p1_angle_deg` and `hwp_angle_deg` are what the pump mounts were **actually set to**,
+  read off the lookup table — the record of the calibration this scan relied on.
 * `reachable_min` / `reachable_max` are what the table could deliver at that angle, so
   an `unreachable` row explains itself: the requested power was outside that range and
   nothing was moved.
 * `status` is `complete`, `failed` or `unreachable`. Only `complete` rows are used when
   the summaries are rebuilt, which is why a failed angle leaves an honest gap in the
   polar figures instead of a point at the wrong power.
-* Re-running an angle replaces its row; rows stay sorted by angle.
+* Re-running a point replaces its row; rows stay sorted by angle.
 
-### 6.5 A polarization scan's results
+`ellipticity_scan.csv` is the same table with `analyzer_angle_deg` as its second column
+and no reachability columns — reachability is a property of the pump angle, and a pump
+angle the table cannot serve writes one `unreachable` row per point of its sweep, so the
+log says exactly what was not recorded:
+
+```csv
+laser_angle_deg,analyzer_angle_deg,power_label,requested_power,unit,p1_angle_deg,hwp_angle_deg,status,chunks,duration_s,recorded_at,note
+0,0,50mW_las000p0_hwp000p0,50,mW,0,22.5,complete,4,120,2026-07-30 14:27:32,
+0,15,50mW_las000p0_hwp015p0,50,mW,0,22.5,complete,4,120,2026-07-30 14:29:41,
+```
+
+Both logs are also what the analysis reads to know which points exist: it prefers the
+log over the configured plan, so a folder replays as it was actually recorded rather
+than as it was requested.
+
+### 6.5 A laser angle scan's results
 
 ```
-results/{MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/polarization/
-    25mW/summary/intensity_vs_angle.png     one polar panel per channel
-    25mW/summary/g2_vs_angle.png            one polar panel per pair
+results/{MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/laser_angle/
+    25mW/summary/intensity_vs_angle.png     polar on top, linear below, minima marked
+    25mW/summary/g2_vs_angle.png            one row per harmonic: auto pair, then cross
+    25mW/summary/R_vs_angle.png             one row per cross family
     25mW/summary/harmonics_vs_angle.png     2×N: intensity on top, auto-g² below
-    25mW/summary/polarization_summary.csv   the same numbers as text
-    25mW/angles/25mW_pol000p0/…             the ordinary analysis tree of one angle
-    25mW/angles/25mW_pol015p0/…
+    25mW/summary/interpolated_minima.csv    the angle of each intensity minimum
+    25mW/angles/25mW_las000p0/…             one full HBT tree per angle, only with
+    25mW/angles/25mW_las015p0/…               LASER_ANGLE_PLOT_ANGLES=True
     45mW/…                                  one folder per power in this DATE folder
     65mW/…
-    overlay/intensity_vs_angle.png          the same three layouts, every power
+    overlay/intensity_vs_angle.png          the same four layouts, every power
     overlay/g2_vs_angle.png                   overlaid as coloured butterflies
+    overlay/R_vs_angle.png
     overlay/harmonics_vs_angle.png
 ```
 
 Each power is self-contained, so a scan can be added to the folder later and only the
 overlay has to be redrawn. `overlay/` appears only when at least two powers are present.
+
+### 6.6 An ellipticity scan's results
+
+```
+results/{MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/ellipticity/
+    50mW/las000p0/intensity_vs_angle.png    the same four layouts as §6.5, but against
+    50mW/las000p0/g2_vs_angle.png             ANALYZER angle, with the fitted sinusoid
+    50mW/las000p0/R_vs_angle.png              drawn on the linear intensity panels
+    50mW/las000p0/harmonics_vs_angle.png
+    50mW/las000p0/sinusoidal_fit.csv        every fitted parameter of that sweep
+    50mW/las045p0/…                         one folder per laser angle
+    50mW/las090p0/…
+    50mW/summary/ellipticity_vs_laser_angle.png    the result of the scan
+    50mW/summary/ellipticity_vs_laser_angle.csv    …and its numbers
+    50mW/summary/modulation_vs_laser_angle.png     what ε was derived from
+    50mW/summary/sinusoid_fits_H3.png              every sweep and its fit, side by side
+    50mW/summary/sinusoid_fits_H5.png
+    50mW/summary/sinusoidal_fit.csv                every fit of the whole power
+    50mW/las045p0/points/…                  one full HBT tree per (pump, analyzer) pair,
+                                              only with ELLIPTICITY_PLOT_POINTS=True
+    30mW/…                                  one folder per power in this DATE folder
+    overlay/ellipticity_vs_laser_angle.png  every power on the same axes
+    overlay/modulation_vs_laser_angle.png
+```
+
+`ellipticity_vs_laser_angle.csv` is the table the scan exists to produce — one row per
+(laser angle, harmonic):
+
+```csv
+power_label,laser_angle_deg,harmonic,ellipticity,ellipticity_std,modulation,modulation_std,attenuation,mean_intensity,r_squared,n_analyzer_angles
+50mW,0,H3,0.0494,0.00072,0.99514,0.00014,0.00244,40574.8,0.99894,12
+50mW,45,H3,0.55536,0.00544,0.52856,0.00705,0.30842,39210.0,0.99674,12
+50mW,90,H3,0.95541,0.00086,0.04558,0.00089,0.91281,40008.1,0.88127,12
+```
+
+Read as: at 0° the emission is linear, at 90° it is nearly circular, and 45° sits in
+between. `sinusoidal_fit.csv` holds the same fits with the raw parameters (offset,
+amplitude, phase, RMSE) and adds one row per **channel** as well as per harmonic —
+a transmitted and a reflected arm that disagree is how a mis-set analyzer or a clipped
+beam shows up.
 
 ---
 
@@ -951,6 +1214,21 @@ The key becomes the sub-folder name under `results/{POWER}/`, so it is worth kee
 tidy. Any prefix is allowed as long as `{POWER}_num<N>` appears somewhere, which is
 why the historical David-setup files load unchanged.
 
+An angle scan exploits that: each point's *label* is the power label plus its angles, and
+that label plays the part of `{POWER}` for the whole pipeline.
+
+```
+50mW_las015p0_num1.pkl              laser angle scan: pump at 15°
+50mW_las045p0_hwp030p0_num1.pkl     ellipticity scan: pump at 45°, analyzer at 30°
+```
+
+`experiment_config.angle_tag` builds those tags — `las` for the pump angle, `hwp` for the
+analyzer plate — at fixed width, `045p5` for 45.5°, wrapped into `[0, 360)`. Fixed width
+is what keeps no label a prefix of another, so the `*{label}_num*` glob cannot pick up
+two angles at once; and the `hwp` half is what keeps the two scans' files apart when they
+share a `DATE` folder. Angles are therefore resolved to 0.1°, and two angles closer than
+that are refused at config time (§4.8).
+
 ### 7.3 Channels, labels, harmonics
 
 * `MODES` maps the **physical tagger channel number** to a label. Channel numbers do
@@ -981,13 +1259,18 @@ file or talks to a mount lives next to the rest of that concern, not in a sixth 
 
 ### 8.1 `experiment_config.py`
 
-**Part 1 — `ExperimentConfig`.** The dataclass of §4, plus `REPO_ROOT`,
-`angle_tag` and `harmonic_of`. Pure data and derivations.
+**Part 1 — `ExperimentConfig`.** The dataclass of §4, plus `REPO_ROOT` and the
+derivations of §4.8. Pure data.
 
 **Part 2 — `experiment_config.txt`.** The INI writer that used to live in its own
 module (`write_configuration`, `record_run`, `path_for`). Same semantics as §6.2:
 shared sections rewritten every run, `[run <power>]` sections accumulated,
-`[power_scan]` / `[polarization_scan]` exempt from the drift warning.
+`[power_scan]` / `[laser_angle_scan]` / `[ellipticity_scan]` exempt from the drift
+warning.
+
+**Part 3 — naming helpers.** `angle_tag` and the `laser_angle_tag` / `analyzer_angle_tag`
+pair that name every file of a scan (§7.2), `harmonic_of`, and the two validators that
+refuse labels which would collide.
 
 ### 8.2 `hardware.py`
 
@@ -1001,10 +1284,16 @@ manager, dry-run). Details that are not obvious from the Kinesis documentation:
 * Benchtop controllers expose one channel per axis: the object that moves is
   `device.GetChannel(channel)`, the one that disconnects is the controller.
 
-**Part 2 — linear polarization.** `LookupTable`, `PolarizationController`,
-`preflight`, `ScanLog`. Reads the P1/HWP lookup table, picks the smallest HWP angle
-that delivers the requested power, moves P1 then the HWP. Same conventions as the
-lab's calibration script (§3.6).
+**Part 2 — the pump's polarization.** `LookupTable`, `PumpController`, `preflight`.
+Reads the P1/HWP lookup table, picks the smallest HWP angle that delivers the requested
+power, moves P1 then the HWP. Same conventions as the lab's calibration script (§3.6).
+
+**Part 3 — the analyzer, and the scan logs.** `AnalyzerController` is the plate after the
+crystal: a thin wrapper over `RotationStage` with no calibration behind it, so that an
+ellipticity scan reads like the pump half of a run (a context manager, one `set_angle`
+per point, the same settle time, the same dry run). `LaserAngleLog` and `EllipticityLog`
+share a `_CsvLog` base and write the two tables of §6.4 — one row per point, keyed by
+its file label, so re-running a point replaces its row.
 
 Nothing in this file imports the tagger or the analysis.
 
@@ -1042,15 +1331,27 @@ spectrograms, window sweeps, power summaries (§9).
 `get_peaks`), and out-of-range satellites are skipped so they cannot inflate g²(0)
 (§10.7).
 
-**Part 3 — polar summaries versus angle.** `plot_polarization_summary(cfg)` writes the
-three figures of §3.6 plus `polarization_summary.csv` for one power;
-`plot_polarization_campaign(cfg)` does that for every power of the folder and then
-`plot_polarization_overlay` redraws the same three layouts with all powers on each panel
-(§6.5). `discover_polarization_powers` is what finds the powers when they are not listed.
+**Part 3 — summaries versus angle.** `collect_angle_series` averages the chunks of every
+point of a scan, and `plot_angle_summary` writes the four figures of §3.6 from that
+series. Neither knows *which* angle is on the axis, which is what lets the ellipticity
+scan reuse them for its analyzer sweeps. On top of that,
+`plot_laser_angle_summary(cfg)` does one power, `plot_laser_angle_campaign(cfg)` every
+power of the folder, and `plot_laser_angle_overlay` redraws the four layouts with all
+powers on each panel (§6.5). `discover_laser_angle_powers` finds the powers when they are
+not listed.
 
 All of it reuses `get_data` / `get_peaks` / `compute_g2_integration`, so a point on a
 polar figure is the number the per-angle tree would give for that angle, and the band
 around it is the standard deviation over that angle's chunks.
+
+**Part 4 — the ellipticity fits.** `fit_sinusoid` is the whole physics: a least-squares
+solve at the fixed period of §3.7, whose uncertainties `ellipticity_of` propagates into
+the ellipticity. `fit_angle_series` applies it to every harmonic and channel of one
+sweep; `plot_ellipticity_power(cfg, power)` fits every sweep of one power, draws its four
+vs-analyzer-angle figures, then `plot_ellipticity_vs_laser_angle`,
+`plot_modulation_vs_laser_angle` and `plot_sinusoid_fits`;
+`plot_ellipticity_campaign(cfg)` does that for every power and overlays them
+(§6.6). `write_sinusoid_csv` and `write_ellipticity_csv` are the two tables.
 
 ### 8.5 `run_experiment.py`
 
@@ -1059,12 +1360,14 @@ The `CONFIG` block and the orchestration around it:
 | Function | Role |
 | --- | --- |
 | `main(cfg)` | acquire (unless `ANALYZE_ONLY`), analyse, print the summary |
-| `acquire(cfg)` | power scan, polarization scan, or single power |
+| `acquire(cfg)` | dispatch: ellipticity scan, laser angle scan, power scan, or single power |
 | `acquire_one(cfg)` | one acquisition + optional stability plots |
-| `acquire_polarization_scan(cfg)` | preflight, move, record, CSV log |
-| `open_stage` / `open_polarizer` | dry-run aware hardware handles |
+| `acquire_laser_angle_scan(cfg)` | per power: preflight, move the pump, record, CSV log, summary |
+| `acquire_ellipticity_scan(cfg)` | the same with the analyzer sweep nested inside each pump angle |
+| `open_stage` / `open_pump` / `open_analyzer` | dry-run aware hardware handles |
 | `describe_configuration(cfg)` | the folder's config file, written only if absent |
-| `analyze_polarization_scan(cfg)` | one `run_analysis` per angle of each power, then the summaries and the overlay |
+| `analyze_laser_angle_scan(cfg)` | the vs-angle summaries and the overlay, then the per-angle trees if asked |
+| `analyze_ellipticity_scan(cfg)` | every sweep fitted, ellipticity versus laser angle, then the per-point trees if asked |
 | `print_summary(cfg, runs)` | one block per recorded point |
 
 `matplotlib.use("Agg")` runs before anything imports `pyplot`. Every module imports
@@ -1275,41 +1578,48 @@ one line:
 | To check | Set | What still happens |
 | --- | --- | --- |
 | the configuration is valid | *(nothing)* | `python src/config_examples.py`, or just build your `ExperimentConfig`: §4.8 runs at construction |
-| the scan plan and the angles | `ROTATION_STAGE_DRY_RUN=True`, `POLARIZATION_STAGE_DRY_RUN=True` | the loop, the angle for every point, the preflight against the lookup table, `experiment_config.txt` — every move is printed, no mount is touched, and no Kinesis import is attempted |
+| the scan plan and the angles | `ROTATION_STAGE_DRY_RUN=True`, `PUMP_STAGE_DRY_RUN=True`, `ELLIPTICITY_ANALYZER_DRY_RUN=True` | the loop, the angle for every point, the preflight against the lookup table, `experiment_config.txt` — every move is printed, no mount is touched, and no Kinesis import is attempted |
 | the analysis and the figures | `ANALYZE_ONLY=True` | the whole plot tree, on data already in `DATA_DIR` |
 
-Only the acquisition itself needs the tagger, so a polarization scan can be rehearsed
-end to end but for the counts:
+Only the acquisition itself needs the tagger, so an angle scan can be rehearsed end to
+end but for the counts:
 
 ```python
-POLARIZATION_SCAN=np.arange(0.0, 360.0, 15.0),
-POLARIZATION_POWER=50.0,
-POLARIZATION_STAGE_DRY_RUN=True,     # prints every P1 / HWP angle, moves nothing
+ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],
+PUMP_POWER=50.0,
+PUMP_STAGE_DRY_RUN=True,              # prints every P1 / HWP angle, moves nothing
+ELLIPTICITY_ANALYZER_DRY_RUN=True,    # prints every plate angle, moves nothing
 ```
 
-That prints the preflight — which angles the table can serve at that power, and which
-would be skipped — before you commit hours of beam time to a scan with holes in it.
+That prints the preflight — which pump angles the table can serve at that power, and
+which would be skipped — before you commit hours of beam time to a scan with holes in it.
+The two dry-run flags also stand in for their `*_ENABLED` counterparts, so a rehearsal is
+those lines and no other edit.
+
+And `tests/rehearsal/` rehearses the whole thing against a synthetic source, tagger
+included (§3.8) — the quickest way to see what the figures will look like, and the only
+check that the fit returns the ellipticity that went in.
 
 ### 10.17 Two powers came out as one curve
 
 Power labels are matched with a `*{label}*` glob, so `"5mW"` also matches every
 `45mW_num*.pkl` and the two powers end up averaged into one point. A scan or a
-`POLARIZATION_POWERS` list containing labels nested like that is refused at config time
+`PUMP_POWERS` list containing labels nested like that is refused at config time
 (§4.8); a `POWER_LEVELS` list is not, so pad the labels to the same width — `"05mW"`,
 `"45mW"` — or rename them. Symptom before it is spotted: suspiciously smooth data and a
 chunk count that is a multiple of what was recorded.
 
-### 10.18 The polarization summary is missing angles
+### 10.18 An angle scan's summary is missing angles
 
-Only rows with `status = complete` in `polarization_scan.csv` (§6.4) are summarised. An
-angle can be missing because the requested power was out of reach there
-(`status = unreachable`, and the preflight said so before the scan started), because its
-acquisition raised (`failed`), or because its files were moved. The CSV names the reason
-per angle; the polar figures leave the gap rather than interpolating over it.
+Only rows with `status = complete` in the scan log (§6.4) are summarised. An angle can be
+missing because the requested power was out of reach there (`status = unreachable`, and
+the preflight said so before the scan started), because its acquisition raised (`failed`),
+or because its files were moved. The CSV names the reason per angle; the polar figures
+leave the gap rather than interpolating over it.
 
 If *every* angle is missing, the powers were probably not discovered: check that the
 file names still contain the power label, or list the powers explicitly with
-`POLARIZATION_POWERS`.
+`PUMP_POWERS`.
 
 ### 10.19 `ImportError: Reaching the Thorlabs stage needs pythonnet`
 
@@ -1347,6 +1657,40 @@ and `POWER_SCAN_STOP_ON_ERROR=False` let the scan continue; the analyzer then fi
 files for it and prints `No files found. Skipping.` (§10.2). Re-run just that point
 with a single-power `CONFIG`, then replay the whole folder with `ANALYZE_ONLY=True` and
 the full `POWER_LEVELS`.
+
+### 10.24 Every ellipticity comes out at 1 (circular)
+
+An ellipticity of 1 means the fitted sinusoid was flat, and a plate that never moved
+produces exactly that. Check `analyzer_motion` in `[ellipticity_scan]`: `dry run (angles
+logged, nothing moved)` means `ELLIPTICITY_ANALYZER_DRY_RUN` was left on from a rehearsal.
+(The combination "ellipticity scan configured, `ELLIPTICITY_ANALYZER_ENABLED=False`" is
+refused outright, for this reason.) Otherwise look at
+`summary/sinusoid_fits_{harmonic}.png`: a genuine circular emission is a flat curve
+through scattered points, a plate that did not move is a flat curve through points with
+no scatter at all.
+
+Read the other end of the scale the same way: ε ≈ 0 with an R² near 1 is a linear
+polarization, ε ≈ 0 with a poor R² usually means the sweep is not a sinusoid of period 90°
+at all — check that the analyzer really is a half-wave plate and that
+`ELLIPTICITY_FIT_PERIOD_DEG` matches it.
+
+### 10.25 `fewer than 4 analyzer angles with data, sweep skipped`
+
+The fit has three free parameters, so it needs four points. Either that pump angle was
+`unreachable` and its whole sweep was skipped (§6.4, §10.18), or its files are not where
+the analysis looks: an ellipticity point's files are `{power}_las{XXX}_hwp{YYY}_num*`, and
+a renamed or moved file is invisible to that glob. `ELLIPTICITY_ANALYZER_ANGLES` shorter
+than four points is refused at config time, so it cannot be the cause here.
+
+### 10.26 An ellipticity scan takes much longer than expected
+
+It is one acquisition per (pump angle, analyzer angle) pair, so the total is
+`ACQUISITION_DURATION_S × n_laser × n_analyzer` — three pump angles and a 15° sweep is 36
+acquisitions, which at two minutes each is well over an hour before any analysis. Cut the
+per-point duration rather than the number of analyzer angles: the fit's precision comes
+from the sweep, and the shape of a sinusoid is not recoverable from four points as well as
+from twelve. `ELLIPTICITY_PLOT_POINTS=True` adds one full HBT tree per pair on top of
+that; leave it off unless you need them (§11.9).
 
 ---
 
@@ -1406,7 +1750,7 @@ or so per point and is why an already-open session breaks a scan halfway through
 (§11.5) rather than at the start. Passing an open tagger through the loop would fix
 both, at the price of a wider interface.
 
-### 11.8 The polarization is set open-loop
+### 11.8 The pump polarization is set open-loop
 
 The HWP angle comes from a table measured earlier; no power meter is read during the
 scan, so nothing checks that the power actually held at every angle. That is deliberate
@@ -1415,9 +1759,28 @@ lookup table is the whole guarantee. Recalibrate after touching the optics, and 
 `intensity_vs_angle.png` panels as the sanity check: a channel whose total signal tracks
 the HWP setting rather than the physics is the symptom of a stale table.
 
-### 11.9 A polarization scan is analysed angle by angle
+### 11.9 The per-angle trees of a scan are expensive
 
-`run_analysis` runs once per angle, so a 24-angle scan renders 24 full analysis trees at
-dpi 700 — long. Set `RUN_ANALYSIS_AFTER_ACQUIRE=False` to record first and replay later,
-or call `pkl_json_analyze.plot_polarization_campaign(cfg)` directly to get only the
-circle plots and skip the per-angle trees.
+`run_analysis` runs once per point, so a 24-angle scan renders 24 full analysis trees at
+dpi 700 — long. That is why `LASER_ANGLE_PLOT_ANGLES` and `ELLIPTICITY_PLOT_POINTS`
+default to `False`: the vs-angle summaries, which are what the scan is for, are always
+drawn and cost a fraction of that. Turn the flags on when you need the per-point HBT
+figures, ideally on a replay (`ANALYZE_ONLY=True`) rather than while the beam is waiting.
+
+### 11.10 The ellipticity is a magnitude, not a signed one
+
+`ε = sqrt(I_min/I_max)` is the ratio of the ellipse's axes, so it says how elliptical the
+emission is but not which way it turns: a left- and a right-circular emission both come
+out at 1. Handedness is not accessible from a half-wave plate and a fixed polarizer at
+all — it needs a quarter-wave plate, i.e. a different measurement. The fitted `phase_deg`
+in `sinusoidal_fit.csv` does carry the **orientation** of the ellipse's major axis, which
+is the part of the polarization state this setup can still report.
+
+### 11.11 A flat sweep and a dark one look alike to the fit
+
+The fit reads the modulation as `amplitude / offset`, which is a ratio: a sweep whose
+signal is genuinely flat and one whose signal is buried in a background both give a small
+modulation, hence an ellipticity near 1. Nothing subtracts a background, and no dark
+count is recorded. `mean_intensity` in `ellipticity_vs_laser_angle.csv` is the fitted
+offset and therefore the number to check — an ellipticity near 1 at an intensity far
+below the other pump angles' is more likely a weak signal than a circular one.

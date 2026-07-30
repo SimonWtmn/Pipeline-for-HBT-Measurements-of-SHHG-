@@ -1,11 +1,14 @@
-"""Everything that moves: the Thorlabs rotation mounts, and the linear polarization
-built on top of two of them.
+"""Everything that moves: the Thorlabs rotation mounts, and the polarizations built on
+top of them.
 
 * `RotationStage` drives a single Thorlabs mount through Kinesis. A power scan uses
   one of these on its own, to turn a wave plate to a calibrated angle per power.
-* `PolarizationController` drives the half-wave plate and the polarizer together,
-  reading the angles it needs from a P1/HWP lookup table recorded beforehand.
-  `LookupTable`, `ScanLog` and `preflight` belong to that half.
+* `PumpController` drives the pump's half-wave plate and polarizer together (BEFORE
+  the crystal), reading the angles it needs from a P1/HWP lookup table recorded
+  beforehand. `LookupTable`, `LaserAngleLog` and `preflight` belong to that half.
+* `AnalyzerController` drives the single half-wave plate AFTER the crystal, in front of
+  the fixed polarizer, which is what an ellipticity scan turns. `EllipticityLog`
+  records its sweeps.
 
 No hardware library is imported until something actually connects, which is what lets
 every dry run, analysis and replot happen on a laptop.
@@ -422,7 +425,7 @@ class RotationStage:
 
 
 # ============================================================================
-# PART 2 - linear polarization from a measured lookup table
+# PART 2 - the pump's linear polarization, from a measured lookup table
 # ============================================================================
 #
 # The table lives in `polarization_calibration/` and is REUSED across runs: recording
@@ -442,10 +445,11 @@ class RotationStage:
 
 LATEST_CALIBRATION_NAME = "linear_polarization_lookup_latest.npz"
 CALIBRATION_GLOB = "linear_polarization_lookup_*.npz"
-SCAN_LOG_NAME = "polarization_scan.csv"
+SCAN_LOG_NAME = "laser_angle_scan.csv"
+ELLIPTICITY_LOG_NAME = "ellipticity_scan.csv"
 
 SCAN_LOG_COLUMNS = [
-    "polarization_angle_deg",
+    "laser_angle_deg",
     "power_label",
     "requested_power",
     "unit",
@@ -453,6 +457,23 @@ SCAN_LOG_COLUMNS = [
     "hwp_angle_deg",
     "reachable_min",
     "reachable_max",
+    "status",
+    "chunks",
+    "duration_s",
+    "recorded_at",
+    "note",
+]
+
+# The analyzer sweep adds its own angle, and drops the reachability of the pump power:
+# a point is only recorded once the pump angle is known to be reachable.
+ELLIPTICITY_LOG_COLUMNS = [
+    "laser_angle_deg",
+    "analyzer_angle_deg",
+    "power_label",
+    "requested_power",
+    "unit",
+    "p1_angle_deg",
+    "hwp_angle_deg",
     "status",
     "chunks",
     "duration_s",
@@ -587,7 +608,7 @@ def find_calibration(directory: Path) -> Path:
     candidates = sorted(directory.glob(CALIBRATION_GLOB), key=lambda p: p.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError(
-            f"No {CALIBRATION_GLOB} in {directory}. Point POLARIZATION_CALIBRATION at an "
+            f"No {CALIBRATION_GLOB} in {directory}. Point PUMP_CALIBRATION at an "
             "existing table, or record a new one with the calibration script."
         )
     return candidates[-1]
@@ -621,8 +642,11 @@ class Setting:
                 f"HWP {self.hwp_angle_deg:g} deg for {self.requested_power:g} {self.unit}")
 
 
-class PolarizationController:
-    """The half-wave plate and the polarizer, driven from the lookup table.
+class PumpController:
+    """The pump's half-wave plate and polarizer, driven from the lookup table.
+
+    Both mounts sit BEFORE the crystal: P1 turns to the requested laser angle, and the
+    HWP to whatever angle the table says delivers the requested power there.
 
     `dry_run=True` connects to nothing and moves nothing, but still reads the table
     and reports the angles it would have used - which is what makes a scan
@@ -637,7 +661,7 @@ class PolarizationController:
         self.hwp = RotationStage(hwp, dry_run=dry_run)
         self.dry_run = dry_run
 
-    def __enter__(self) -> "PolarizationController":
+    def __enter__(self) -> "PumpController":
         self.connect()
         return self
 
@@ -646,7 +670,7 @@ class PolarizationController:
         return False
 
     def connect(self) -> None:
-        print(f"[pol] {self.lookup.describe()}")
+        print(f"[pump] {self.lookup.describe()}")
         self.p1.connect()
         try:
             self.hwp.connect()
@@ -661,7 +685,7 @@ class PolarizationController:
             self.hwp.disconnect()
 
     def plan(self, angle_deg: float, power: float) -> Setting:
-        """Which mount angles a polarization would need. Moves nothing."""
+        """Which mount angles a pump polarization would need. Moves nothing."""
         hwp_angle, low, high = self.lookup.hwp_angle_for(angle_deg, power)
         return Setting(
             angle_deg=float(angle_deg),
@@ -680,10 +704,10 @@ class PolarizationController:
         """Move P1 then the HWP. An unreachable power moves nothing."""
         setting = self.plan(angle_deg, power)
         if not setting.reachable:
-            print(f"[pol] {setting.describe()} - nothing moved")
+            print(f"[pump] {setting.describe()} - nothing moved")
             return setting
 
-        print(f"[pol] {setting.describe()}")
+        print(f"[pump] {setting.describe()}")
         # P1 first: it defines the polarization angle, the HWP then sets the power.
         self.p1.move_to_angle_deg(setting.p1_angle_deg)
         self.hwp.move_to_angle_deg(setting.hwp_angle_deg)
@@ -714,7 +738,7 @@ def preflight(lookup: LookupTable, angles_deg: Sequence[float], power: float) ->
             setting.p1_angle_deg = None
 
     unreachable = [s for s in settings if not s.reachable]
-    print(f"[pol] preflight: {len(settings) - len(unreachable)}/{len(settings)} angles can deliver "
+    print(f"[pump] preflight: {len(settings) - len(unreachable)}/{len(settings)} angles can deliver "
           f"{power:g} {lookup.unit}")
     for setting in unreachable:
         print(f"  skipped - {setting.describe()}")
@@ -723,17 +747,68 @@ def preflight(lookup: LookupTable, angles_deg: Sequence[float], power: float) ->
     return settings
 
 
-# ----------------------------------------------------------------------------
-# The per-angle log
-# ----------------------------------------------------------------------------
+# ============================================================================
+# PART 3 - the analyzer after the crystal
+# ============================================================================
+#
+# One half-wave plate, in front of a polarizer that never moves. Turning the plate by
+# theta turns the harmonic polarization by 2*theta, so what the polarizer transmits
+# repeats every 90 deg of plate angle: a sweep over 0-180 deg samples that curve twice.
+#
+# No calibration is involved - the plate angle IS the requested angle. The measurement
+# is the shape of the transmitted intensity, not its absolute value.
 
-class ScanLog:
-    """`polarization_scan.csv`: one row per angle of the scan.
+class AnalyzerController:
+    """The half-wave plate after the crystal, turned to one angle at a time.
 
-    A polarization scan is dozens of acquisitions, so the per-angle record is a table
-    rather than dozens of sections in `experiment_config.txt` (which keeps holding the
-    setup, shared by the whole folder). Re-running an angle replaces its row.
+    A thin wrapper over `RotationStage`: it exists so an ellipticity scan reads the same
+    way as the pump half of a run (a context manager, one `set_angle` per point, the
+    same settle time), and so `dry_run` prints what it would have turned.
     """
+
+    def __init__(self, config: RotationStageConfig, dry_run: bool = False,
+                 settle_time_s: float = 0.2) -> None:
+        self.stage = RotationStage(config, dry_run=dry_run)
+        self.dry_run = dry_run
+        self.settle_time_s = settle_time_s
+
+    def __enter__(self) -> "AnalyzerController":
+        self.connect()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.disconnect()
+        return False
+
+    def connect(self) -> None:
+        self.stage.connect()
+
+    def disconnect(self) -> None:
+        self.stage.disconnect()
+
+    def set_angle(self, angle_deg: float) -> float:
+        """Turn the plate to `angle_deg`, then let the beam settle."""
+        print(f"[analyzer] plate to {angle_deg:g} deg")
+        self.stage.move_to_angle_deg(angle_deg)
+        if self.settle_time_s > 0 and not self.dry_run:
+            time.sleep(self.settle_time_s)
+        return float(angle_deg)
+
+
+# ----------------------------------------------------------------------------
+# The per-angle logs
+# ----------------------------------------------------------------------------
+
+class _CsvLog:
+    """One row per acquisition of a scan, keyed by the row's file label.
+
+    An angle scan is dozens of acquisitions, so its record is a table rather than
+    dozens of sections in `experiment_config.txt` (which keeps holding the setup, shared
+    by the whole folder). Re-running a point replaces its row.
+    """
+
+    columns: List[str] = []
+    sort_keys: Tuple[str, ...] = ()
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -743,10 +818,50 @@ class ScanLog:
                 for row in csv.DictReader(handle):
                     self.rows[row.get("power_label", "")] = row
 
+    def write(self) -> Path:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.columns)
+            writer.writeheader()
+            for row in sorted(self.rows.values(), key=self._order):
+                writer.writerow({key: row.get(key, "") for key in self.columns})
+        return self.path
+
+    def _order(self, row: Dict[str, Any]) -> Tuple:
+        # A missing angle sorts last rather than making the comparison meaningless.
+        angles = tuple(_as_float(row.get(key), default=float("inf")) for key in self.sort_keys)
+        return angles + (row.get("power_label", ""),)
+
+    def _complete_rows(self, power: Optional[str], tag: str) -> List[Dict[str, Any]]:
+        """The rows that actually hold data, restricted to one campaign's labels."""
+        rows = []
+        for row in self.rows.values():
+            if row.get("status") != "complete":
+                continue
+            if power is not None and not row.get("power_label", "").startswith(f"{power}_{tag}"):
+                continue
+            rows.append(row)
+        return sorted(rows, key=self._order)
+
+    @staticmethod
+    def _outcome(result: Any) -> Dict[str, str]:
+        return {
+            "chunks": str(len(result.chunk_paths)) if result is not None else "",
+            "duration_s": f"{result.duration_s:g}" if result is not None else "",
+            "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+class LaserAngleLog(_CsvLog):
+    """`laser_angle_scan.csv`: one row per pump angle of a laser angle scan."""
+
+    columns = SCAN_LOG_COLUMNS
+    sort_keys = ("laser_angle_deg",)
+
     def record(self, label: str, setting: Setting, status: str,
                result: Any = None, note: str = "") -> Path:
         self.rows[label] = {
-            "polarization_angle_deg": f"{setting.angle_deg:g}",
+            "laser_angle_deg": f"{setting.angle_deg:g}",
             "power_label": label,
             "requested_power": f"{setting.requested_power:g}",
             "unit": setting.unit,
@@ -755,37 +870,52 @@ class ScanLog:
             "reachable_min": f"{setting.reachable_min:g}",
             "reachable_max": f"{setting.reachable_max:g}",
             "status": status,
-            "chunks": str(len(result.chunk_paths)) if result is not None else "",
-            "duration_s": f"{result.duration_s:g}" if result is not None else "",
-            "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "note": note,
+            **self._outcome(result),
         }
         return self.write()
 
-    def write(self) -> Path:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        ordered = sorted(self.rows.values(), key=lambda row: float(row["polarization_angle_deg"]))
-        with self.path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=SCAN_LOG_COLUMNS)
-            writer.writeheader()
-            for row in ordered:
-                writer.writerow({key: row.get(key, "") for key in SCAN_LOG_COLUMNS})
-        return self.path
-
     def recorded_labels(self, power: Optional[str] = None) -> List[Tuple[float, str]]:
-        """(angle, label) of the angles that actually hold data, in angular order.
+        """(angle, label) of the angles that hold data, in angular order.
 
-        `power` restricts to one campaign (labels starting with `{power}_pol`).
+        `power` restricts to one campaign (labels starting with `{power}_las`).
         """
-        rows = []
-        for row in self.rows.values():
-            if row.get("status") != "complete":
-                continue
-            label = row.get("power_label", "")
-            if power is not None and not label.startswith(f"{power}_pol"):
-                continue
-            rows.append(row)
-        return [
-            (float(row["polarization_angle_deg"]), row["power_label"])
-            for row in sorted(rows, key=lambda r: float(r["polarization_angle_deg"]))
-        ]
+        return [(_as_float(row["laser_angle_deg"]), row["power_label"])
+                for row in self._complete_rows(power, "las")]
+
+
+class EllipticityLog(_CsvLog):
+    """`ellipticity_scan.csv`: one row per (pump angle, analyzer angle) pair."""
+
+    columns = ELLIPTICITY_LOG_COLUMNS
+    sort_keys = ("laser_angle_deg", "analyzer_angle_deg")
+
+    def record(self, label: str, laser_angle_deg: float, analyzer_angle_deg: float,
+               setting: Setting, status: str, result: Any = None, note: str = "") -> Path:
+        self.rows[label] = {
+            "laser_angle_deg": f"{float(laser_angle_deg):g}",
+            "analyzer_angle_deg": f"{float(analyzer_angle_deg):g}",
+            "power_label": label,
+            "requested_power": f"{setting.requested_power:g}",
+            "unit": setting.unit,
+            "p1_angle_deg": "" if setting.p1_angle_deg is None else f"{setting.p1_angle_deg:g}",
+            "hwp_angle_deg": "" if setting.hwp_angle_deg is None else f"{setting.hwp_angle_deg:g}",
+            "status": status,
+            "note": note,
+            **self._outcome(result),
+        }
+        return self.write()
+
+    def recorded_points(self, power: Optional[str] = None) -> List[Tuple[float, float, str]]:
+        """(pump angle, analyzer angle, label) of the pairs that hold data, in run order."""
+        return [(_as_float(row["laser_angle_deg"]), _as_float(row["analyzer_angle_deg"]),
+                 row["power_label"])
+                for row in self._complete_rows(power, "las")]
+
+
+def _as_float(value: Any, default: float = float("nan")) -> float:
+    """A CSV field as a number, `default` when it is missing or not one."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default

@@ -3,8 +3,9 @@
     python src/run_experiment.py        # or python -m src.run_experiment
 
 One command covers every mode, all selected from CONFIG: a single power level, an
-automated power scan, a polarization scan, and the analysis-only replays of any of
-them. See README section 3 for the field-by-field description.
+automated power scan, a laser angle scan (the pump's polarization turned before the
+crystal), an ellipticity scan (the analyzer turned after it), and the analysis-only
+replays of any of them. See README section 3 for the field-by-field description.
 """
 
 from __future__ import annotations
@@ -22,15 +23,19 @@ try:
     import hardware
     from experiment_config import ExperimentConfig, record_run, write_configuration
     from hardware import RotationStage, RotationStageConfig
-    from pkl_json_analyze import (discover_polarization_powers, plot_polarization_campaign,
-                                  plot_polarization_overlay, plot_polarization_summary,
+    from pkl_json_analyze import (discover_ellipticity_powers, discover_laser_angle_powers,
+                                  plot_ellipticity_campaign, plot_ellipticity_overlay,
+                                  plot_ellipticity_power, plot_laser_angle_campaign,
+                                  plot_laser_angle_overlay, plot_laser_angle_summary,
                                   plot_stability, run_analysis)
 except ImportError:
     from src import hardware
     from src.experiment_config import ExperimentConfig, record_run, write_configuration
     from src.hardware import RotationStage, RotationStageConfig
-    from src.pkl_json_analyze import (discover_polarization_powers, plot_polarization_campaign,
-                                      plot_polarization_overlay, plot_polarization_summary,
+    from src.pkl_json_analyze import (discover_ellipticity_powers, discover_laser_angle_powers,
+                                      plot_ellipticity_campaign, plot_ellipticity_overlay,
+                                      plot_ellipticity_power, plot_laser_angle_campaign,
+                                      plot_laser_angle_overlay, plot_laser_angle_summary,
                                       plot_stability, run_analysis)
 
 
@@ -90,24 +95,45 @@ CONFIG = ExperimentConfig(
     # ],
     POWER_SCAN_STOP_ON_ERROR=True,
 
-    # ----------------- polarization scan -----------------
-    POLARIZATION_SCAN=None,
-    # POLARIZATION_POWER=90,                  # ignored while POLARIZATION_POWER_SCAN is set
-    # POLARIZATION_POWER_SCAN=[                 # a full angle scan at each power, one run
+    # ----------------- the pump mounts (both angle scans) -----------------
+    # P1 and the HWP before the crystal: P1 turns to the laser angle, the HWP sets the
+    # power there from the calibration table.
+    # PUMP_POWER=90,                          # ignored while PUMP_POWER_SCAN is set
+    # PUMP_POWER_SCAN=[                       # the whole scan at each power, one run
     #     {"power": "90mW", "requested_power": 90.0},
     #     {"power": "70mW", "requested_power": 70.0},
     #     {"power": "50mW", "requested_power": 50.0},
     #     {"power": "30mW", "requested_power": 30.0},
     #     {"power": "20mW", "requested_power": 20.0},
     # ],
-    # POLARIZATION_CALIBRATION=None,          # None -> linear_polarization_lookup_latest.npz
-    # POLARIZATION_CALIBRATION_DIR=None,      # None -> polarization_calibration/
-    # POLARIZATION_STAGE_ENABLED=True,
-    # POLARIZATION_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
-    # POLARIZATION_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
-    # POLARIZATION_SETTLE_TIME_S=0.2,
-    # POLARIZATION_STAGE_DRY_RUN=False,        # rehearse first; set False to move the mounts
-    # POLARIZATION_PLOT_ANGLES=False,         # summaries only; True to also analyse each angle
+    # PUMP_CALIBRATION=None,                  # None -> linear_polarization_lookup_latest.npz
+    # PUMP_CALIBRATION_DIR=None,              # None -> polarization_calibration/
+    # PUMP_STAGE_ENABLED=True,
+    # PUMP_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
+    # PUMP_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
+    # PUMP_SETTLE_TIME_S=0.2,
+    # PUMP_STAGE_DRY_RUN=False,               # rehearse first; set False to move the mounts
+
+    # ----------------- laser angle scan -----------------
+    # One acquisition per pump angle: what the crystal emits as its axes turn.
+    LASER_ANGLE_SCAN=None,
+    # LASER_ANGLE_SCAN=np.arange(0.0, 360.0, 15.0),
+    # LASER_ANGLE_PLOT_ANGLES=False,          # summaries only; True to also analyse each angle
+
+    # ----------------- ellipticity scan -----------------
+    # A whole analyzer sweep at each pump angle: the HWP after the crystal is turned in
+    # front of the fixed polarizer, and the depth of the sinusoid it transmits gives the
+    # ellipticity of the harmonics at that pump angle.
+    ELLIPTICITY_LASER_ANGLES=None,
+    # ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],          # the outer loop
+    # ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),   # the inner loop
+    # ELLIPTICITY_ANALYZER_ENABLED=True,
+    # ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
+    # ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
+    # ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
+    # ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # 90 deg for a half-wave plate
+    # ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata: 0 = vertical
+    # ELLIPTICITY_PLOT_POINTS=False,          # True to also analyse every single point
 
     INTEGRATION_WINDOW=8,
     INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
@@ -125,8 +151,10 @@ def main(cfg: ExperimentConfig = CONFIG):
     # Analyze-only replays the files already on disk, always producing the summaries.
     if cfg.ANALYZE_ONLY:
         print(f"Configuration file: {describe_configuration(cfg)}")
-        if cfg.is_polarization_scan() or cfg.POLARIZATION_POWERS:
-            analyze_polarization_scan(cfg)
+        if cfg.is_ellipticity_scan():
+            analyze_ellipticity_scan(cfg)
+        elif cfg.is_laser_angle_scan() or cfg.PUMP_POWERS:
+            analyze_laser_angle_scan(cfg)
         else:
             run_analysis(cfg)
         print_summary(cfg, runs)
@@ -135,13 +163,17 @@ def main(cfg: ExperimentConfig = CONFIG):
     runs = acquire(cfg)
 
     if cfg.RUN_ANALYSIS_AFTER_ACQUIRE:
-        if cfg.is_polarization_scan():
-            # acquire() already drew each power's vs-angle summary as it finished and
-            # the comparison overlay once every power was recorded; only the optional
-            # (heavy) per-angle HBT trees remain.
-            if cfg.POLARIZATION_PLOT_ANGLES:
-                powers = discover_polarization_powers(cfg.DATA_DIR) or [cfg.POWER_LEVEL]
-                plot_polarization_angle_trees(cfg, powers)
+        # acquire() already drew the summaries of every scan point as it finished, and
+        # the comparison overlay once every power was recorded; only the optional
+        # (heavy) per-point HBT trees remain.
+        if cfg.is_ellipticity_scan():
+            if cfg.ELLIPTICITY_PLOT_POINTS:
+                powers = discover_ellipticity_powers(cfg.DATA_DIR) or [cfg.POWER_LEVEL]
+                plot_ellipticity_point_trees(cfg, powers)
+        elif cfg.is_laser_angle_scan():
+            if cfg.LASER_ANGLE_PLOT_ANGLES:
+                powers = discover_laser_angle_powers(cfg.DATA_DIR) or [cfg.POWER_LEVEL]
+                plot_laser_angle_trees(cfg, powers)
         else:
             run_analysis(cfg)
 
@@ -160,9 +192,11 @@ def describe_configuration(cfg: ExperimentConfig) -> Path:
 
 
 def acquire(cfg: ExperimentConfig) -> List[Run]:
-    """Record a polarization scan, every point of a power scan, or a single power."""
-    if cfg.is_polarization_scan():
-        return acquire_polarization_scan(cfg)
+    """Record an angle scan, every point of a power scan, or a single power."""
+    if cfg.is_ellipticity_scan():
+        return acquire_ellipticity_scan(cfg)
+    if cfg.is_laser_angle_scan():
+        return acquire_laser_angle_scan(cfg)
 
     points = cfg.power_scan_points() or [(cfg.POWER_LEVEL, cfg.ROTATION_ANGLE_DEG)]
     stage = open_stage(cfg)
@@ -209,61 +243,60 @@ def acquire_one(cfg: ExperimentConfig, log_run: bool = True) -> Any:
     return result
 
 
-def acquire_polarization_scan(cfg: ExperimentConfig) -> List[Run]:
-    """Record a polarization scan at one power, or at each power of a multi-power run.
+def acquire_laser_angle_scan(cfg: ExperimentConfig) -> List[Run]:
+    """Record a laser angle scan at one power, or at each power of a multi-power run.
 
-    A multi-power run (POLARIZATION_POWER_SCAN) opens the two mounts once and drives a
-    full angle scan at every power in turn. `with` releases both mounts even when a
-    preflight or configuration-file write raises before the first acquisition.
+    A multi-power run (PUMP_POWER_SCAN) opens the two pump mounts once and drives a full
+    angle scan at every power in turn. `with` releases both mounts even when a preflight
+    or configuration-file write raises before the first acquisition.
     """
-    power_points = cfg.polarization_power_points()
-    log = hardware.ScanLog(cfg.polarization_log_path())
+    power_points = cfg.pump_power_points()
+    log = hardware.LaserAngleLog(cfg.laser_angle_log_path())
     runs: List[Run] = []
     series_by_power: dict = {}
 
-    with open_polarizer(cfg) as controller:
+    with open_pump(cfg) as pump:
         for number, (label, requested) in enumerate(power_points, start=1):
             if len(power_points) > 1:
                 print(f"\n########## power {number}/{len(power_points)}: "
-                      f"{label} ({requested:g} {controller.lookup.unit}) ##########")
-            power_cfg = cfg.for_polarization_scan_power(label, requested)
-            runs.extend(acquire_polarization_power(power_cfg, controller, log))
+                      f"{label} ({requested:g} {pump.lookup.unit}) ##########")
+            power_cfg = cfg.for_pump_scan_power(label, requested)
+            runs.extend(acquire_laser_angle_power(power_cfg, pump, log))
 
             # Draw this power's vs-angle summary the moment its scan finishes, so a long
             # multi-power campaign shows results as it goes - and a completed power keeps
             # its plots even if a later power is interrupted.
             if cfg.RUN_ANALYSIS_AFTER_ACQUIRE:
-                series = plot_polarization_summary(power_cfg)
+                series = plot_laser_angle_summary(power_cfg)
                 if series is not None:
                     series_by_power[label] = series
 
     # Every power on disk: overlay them for the comparison (needs at least two).
     if cfg.RUN_ANALYSIS_AFTER_ACQUIRE and len(series_by_power) > 1:
-        plot_polarization_overlay(series_by_power, cfg.polarization_overlay_dir)
+        plot_laser_angle_overlay(series_by_power, cfg.laser_angle_overlay_dir)
 
     return runs
 
 
-def acquire_polarization_power(cfg: ExperimentConfig, controller: "hardware.PolarizationController",
-                               log: "hardware.ScanLog") -> List[Run]:
-    """One full angle scan at a single power, on an already-open controller."""
-    points = cfg.polarization_scan_points()
+def acquire_laser_angle_power(cfg: ExperimentConfig, pump: "hardware.PumpController",
+                              log: "hardware.LaserAngleLog") -> List[Run]:
+    """One full angle scan at a single power, on an already-open pump controller."""
+    points = cfg.laser_angle_scan_points()
     runs: List[Run] = []
 
     try:
         print(f"Configuration file: {write_configuration(cfg)}")
-        plan = hardware.preflight(controller.lookup, [angle for angle, _ in points],
-                                  cfg.POLARIZATION_POWER)
+        plan = hardware.preflight(pump.lookup, [angle for angle, _ in points], cfg.PUMP_POWER)
 
         for number, ((angle, label), setting) in enumerate(zip(points, plan), start=1):
-            print(f"\n===== angle {number}/{len(points)}: {angle:g} deg ({label}) =====")
+            print(f"\n===== laser angle {number}/{len(points)}: {angle:g} deg ({label}) =====")
             if not setting.reachable:
                 log.record(label, setting, status="unreachable")
                 print(f"Skipped: {setting.describe()}")
                 continue
 
-            setting = controller.set_polarization(angle, cfg.POLARIZATION_POWER)
-            step = cfg.for_polarization(angle)
+            setting = pump.set_polarization(angle, cfg.PUMP_POWER)
+            step = cfg.for_laser_angle(angle)
             log.record(label, setting, status="running")
 
             try:
@@ -272,7 +305,7 @@ def acquire_polarization_power(cfg: ExperimentConfig, controller: "hardware.Pola
                 log.record(label, setting, status="complete", result=result)
             except Exception as exc:
                 log.record(label, setting, status="failed", note=str(exc))
-                print(f"Angle {angle:g} deg failed: {exc}")
+                print(f"Laser angle {angle:g} deg failed: {exc}")
                 if cfg.POWER_SCAN_STOP_ON_ERROR:
                     raise
     finally:
@@ -281,68 +314,209 @@ def acquire_polarization_power(cfg: ExperimentConfig, controller: "hardware.Pola
     return runs
 
 
-def open_polarizer(cfg: ExperimentConfig) -> hardware.PolarizationController:
-    """The polarizer pair, not connected yet: use it as a context manager."""
-    path = cfg.POLARIZATION_CALIBRATION or hardware.find_calibration(cfg.POLARIZATION_CALIBRATION_DIR)
+def acquire_ellipticity_scan(cfg: ExperimentConfig) -> List[Run]:
+    """Record an analyzer sweep at every laser angle, at one power or at several.
+
+    The pump mounts and the analyzer plate are opened once for the whole run: three
+    mounts stay connected while the two nested loops (power, then laser angle, then
+    analyzer angle) drive them. `with` releases all three whatever raises.
+    """
+    power_points = cfg.pump_power_points()
+    log = hardware.EllipticityLog(cfg.ellipticity_log_path())
+    runs: List[Run] = []
+    by_power: dict = {}
+
+    with open_pump(cfg) as pump, open_analyzer(cfg) as analyzer:
+        for number, (label, requested) in enumerate(power_points, start=1):
+            if len(power_points) > 1:
+                print(f"\n########## power {number}/{len(power_points)}: "
+                      f"{label} ({requested:g} {pump.lookup.unit}) ##########")
+            power_cfg = cfg.for_pump_scan_power(label, requested)
+            runs.extend(acquire_ellipticity_power(power_cfg, pump, analyzer, log))
+
+            if cfg.RUN_ANALYSIS_AFTER_ACQUIRE:
+                campaign = plot_ellipticity_power(power_cfg, label)
+                if campaign is not None:
+                    by_power[label] = campaign
+
+    if cfg.RUN_ANALYSIS_AFTER_ACQUIRE and len(by_power) > 1:
+        plot_ellipticity_overlay(by_power, cfg.ellipticity_overlay_dir)
+
+    return runs
+
+
+def acquire_ellipticity_power(cfg: ExperimentConfig, pump: "hardware.PumpController",
+                              analyzer: "hardware.AnalyzerController",
+                              log: "hardware.EllipticityLog") -> List[Run]:
+    """Every (laser angle, analyzer angle) pair of one power, in run order.
+
+    The pump is set once per laser angle and the analyzer turns through its whole sweep
+    there: the pump mounts move a few times, the analyzer many, which is both the
+    quickest order and the one that keeps a sweep internally consistent.
+    """
+    laser_angles = cfg.ellipticity_laser_angles()
+    runs: List[Run] = []
+
+    try:
+        print(f"Configuration file: {write_configuration(cfg)}")
+        plan = hardware.preflight(pump.lookup, laser_angles, cfg.PUMP_POWER)
+
+        for number, (laser_angle, setting) in enumerate(zip(laser_angles, plan), start=1):
+            print(f"\n########## laser angle {number}/{len(laser_angles)}: "
+                  f"{laser_angle:g} deg ##########")
+            points = cfg.ellipticity_analyzer_points(laser_angle)
+            if not setting.reachable:
+                # One row per skipped point, so the log says what was not recorded.
+                for analyzer_angle, label in points:
+                    log.record(label, laser_angle, analyzer_angle, setting, status="unreachable")
+                print(f"Skipped: {setting.describe()}")
+                continue
+
+            setting = pump.set_polarization(laser_angle, cfg.PUMP_POWER)
+
+            for index, (analyzer_angle, label) in enumerate(points, start=1):
+                print(f"\n===== analyzer {index}/{len(points)}: "
+                      f"{analyzer_angle:g} deg ({label}) =====")
+                analyzer.set_angle(analyzer_angle)
+                step = cfg.for_ellipticity_point(laser_angle, analyzer_angle)
+                log.record(label, laser_angle, analyzer_angle, setting, status="running")
+
+                try:
+                    result = acquire_one(step, log_run=False)
+                    runs.append((step, result))
+                    log.record(label, laser_angle, analyzer_angle, setting,
+                               status="complete", result=result)
+                except Exception as exc:
+                    log.record(label, laser_angle, analyzer_angle, setting,
+                               status="failed", note=str(exc))
+                    print(f"Analyzer {analyzer_angle:g} deg at laser {laser_angle:g} deg "
+                          f"failed: {exc}")
+                    if cfg.POWER_SCAN_STOP_ON_ERROR:
+                        raise
+    finally:
+        print(f"Per-point log: {log.write()}")
+
+    return runs
+
+
+def open_pump(cfg: ExperimentConfig) -> hardware.PumpController:
+    """The pump's polarizer pair, not connected yet: use it as a context manager."""
+    path = cfg.PUMP_CALIBRATION or hardware.find_calibration(cfg.PUMP_CALIBRATION_DIR)
     lookup = hardware.load_lookup(path)
-    dry_run = cfg.POLARIZATION_STAGE_DRY_RUN or not cfg.POLARIZATION_STAGE_ENABLED
-    return hardware.PolarizationController(
+    dry_run = cfg.PUMP_STAGE_DRY_RUN or not cfg.PUMP_STAGE_ENABLED
+    return hardware.PumpController(
         lookup,
-        p1=cfg.POLARIZATION_P1 or RotationStageConfig(),
-        hwp=cfg.POLARIZATION_HWP or RotationStageConfig(),
+        p1=cfg.PUMP_P1 or RotationStageConfig(),
+        hwp=cfg.PUMP_HWP or RotationStageConfig(),
         dry_run=dry_run,
-        settle_time_s=cfg.POLARIZATION_SETTLE_TIME_S,
+        settle_time_s=cfg.PUMP_SETTLE_TIME_S,
     )
 
 
-def analyze_polarization_scan(cfg: ExperimentConfig) -> None:
+def open_analyzer(cfg: ExperimentConfig) -> hardware.AnalyzerController:
+    """The plate after the crystal, not connected yet: use it as a context manager."""
+    dry_run = cfg.ELLIPTICITY_ANALYZER_DRY_RUN or not cfg.ELLIPTICITY_ANALYZER_ENABLED
+    return hardware.AnalyzerController(
+        cfg.ELLIPTICITY_ANALYZER or RotationStageConfig(),
+        dry_run=dry_run,
+        settle_time_s=cfg.ELLIPTICITY_ANALYZER_SETTLE_TIME_S,
+    )
+
+
+def analyze_laser_angle_scan(cfg: ExperimentConfig) -> None:
     """Write the vs-angle summaries first, then the per-angle trees only if asked.
 
-    The circle/butterfly plots versus angle are the point of a polarization scan, so
-    they are drawn first and always. The per-angle analysis trees are heavy and rarely
-    the first thing looked at, so they are only produced when POLARIZATION_PLOT_ANGLES
-    is True. Powers come from `POLARIZATION_POWERS` when set (analyze-only multi-power),
-    else from the files already in DATA_DIR, else from the single `POWER_LEVEL`.
+    The circle/butterfly plots versus angle are the point of a laser angle scan, so they
+    are drawn first and always. The per-angle analysis trees are heavy and rarely the
+    first thing looked at, so they are only produced when LASER_ANGLE_PLOT_ANGLES is
+    True. Powers come from `PUMP_POWERS` when set (analyze-only multi-power), else from
+    the files already in DATA_DIR, else from the single `POWER_LEVEL`.
     """
-    powers = list(cfg.POLARIZATION_POWERS) if cfg.POLARIZATION_POWERS else discover_polarization_powers(cfg.DATA_DIR)
+    powers = list(cfg.PUMP_POWERS) if cfg.PUMP_POWERS else discover_laser_angle_powers(cfg.DATA_DIR)
     if not powers:
         powers = [cfg.POWER_LEVEL]
 
     # One summary per power, then the multi-power butterfly overlay when >= 2 powers.
-    plot_polarization_campaign(
-        replace(cfg, POLARIZATION_POWERS=powers) if cfg.POLARIZATION_POWERS is None else cfg
+    plot_laser_angle_campaign(
+        replace(cfg, PUMP_POWERS=powers) if cfg.PUMP_POWERS is None else cfg
     )
 
-    if not cfg.POLARIZATION_PLOT_ANGLES:
-        print("\nPer-angle analysis skipped (set POLARIZATION_PLOT_ANGLES=True to draw them).")
+    if not cfg.LASER_ANGLE_PLOT_ANGLES:
+        print("\nPer-angle analysis skipped (set LASER_ANGLE_PLOT_ANGLES=True to draw them).")
         return
 
-    plot_polarization_angle_trees(cfg, powers)
+    plot_laser_angle_trees(cfg, powers)
 
 
-def plot_polarization_angle_trees(cfg: ExperimentConfig, powers: List[str]) -> None:
-    """The heavy per-angle HBT trees under results/.../polarization/{power}/angles/.
+def analyze_ellipticity_scan(cfg: ExperimentConfig) -> None:
+    """Fit every analyzer sweep on disk, then the ellipticity versus laser angle."""
+    powers = list(cfg.PUMP_POWERS) if cfg.PUMP_POWERS else discover_ellipticity_powers(cfg.DATA_DIR)
+    if not powers:
+        powers = [cfg.POWER_LEVEL]
 
-    Drawn only when POLARIZATION_PLOT_ANGLES is True, whether analyzing on disk or
-    right after an acquisition; the vs-angle summaries are handled elsewhere.
+    plot_ellipticity_campaign(
+        replace(cfg, PUMP_POWERS=powers) if cfg.PUMP_POWERS is None else cfg
+    )
+
+    if not cfg.ELLIPTICITY_PLOT_POINTS:
+        print("\nPer-point analysis skipped (set ELLIPTICITY_PLOT_POINTS=True to draw it).")
+        return
+
+    plot_ellipticity_point_trees(cfg, powers)
+
+
+def plot_laser_angle_trees(cfg: ExperimentConfig, powers: List[str]) -> None:
+    """The heavy per-angle HBT trees under results/.../laser_angle/{power}/angles/.
+
+    Drawn only when LASER_ANGLE_PLOT_ANGLES is True, whether analyzing on disk or right
+    after an acquisition; the vs-angle summaries are handled elsewhere.
     """
     for power in powers:
-        power_cfg = cfg.for_polarization_power(power)
-        if cfg.POLARIZATION_SCAN is not None:
-            angles = list(cfg.POLARIZATION_SCAN)
+        power_cfg = cfg.for_pump_power(power)
+        if cfg.LASER_ANGLE_SCAN is not None:
+            angles = list(cfg.LASER_ANGLE_SCAN)
         else:
-            angles = [angle for angle, _ in hardware.ScanLog(cfg.polarization_log_path()).recorded_labels(power=power)]
+            angles = [angle for angle, _ in
+                      hardware.LaserAngleLog(cfg.laser_angle_log_path()).recorded_labels(power=power)]
         if not angles:
-            print(f"\n[{power}] No polarization angles found. Skipping.")
+            print(f"\n[{power}] No laser angles found. Skipping.")
             continue
-        power_cfg = replace(power_cfg, POLARIZATION_SCAN=angles)
+        power_cfg = replace(power_cfg, LASER_ANGLE_SCAN=angles)
 
-        for angle, label in power_cfg.polarization_scan_points():
-            step = power_cfg.for_polarization(angle)
-            if not any(cfg.DATA_DIR.glob(f"*{label}*")):
+        for angle, label in power_cfg.laser_angle_scan_points():
+            step = power_cfg.for_laser_angle(angle)
+            if not any(cfg.DATA_DIR.glob(f"{label}_num*")):
                 print(f"\n[{label}] No files found. Skipping.")
                 continue
             print(f"\n================ {label} ({angle:g} deg) ================")
+            run_analysis(step)
+
+
+def plot_ellipticity_point_trees(cfg: ExperimentConfig, powers: List[str]) -> None:
+    """The heavy per-point HBT trees of an ellipticity scan, one per analyzer angle.
+
+    Drawn only when ELLIPTICITY_PLOT_POINTS is True: there is one tree per (laser angle,
+    analyzer angle) pair, so a 3 x 12 scan produces 36 of them.
+    """
+    log = hardware.EllipticityLog(cfg.ellipticity_log_path())
+    for power in powers:
+        power_cfg = cfg.for_pump_power(power)
+        recorded = log.recorded_points(power=power)
+        points = ([(laser, analyzer) for laser, analyzer, _label in recorded] or
+                  [(laser, analyzer)
+                   for laser in cfg.ellipticity_laser_angles()
+                   for analyzer in cfg.ELLIPTICITY_ANALYZER_ANGLES])
+        if not points:
+            print(f"\n[{power}] No ellipticity points found. Skipping.")
+            continue
+
+        for laser_angle, analyzer_angle in points:
+            step = power_cfg.for_ellipticity_point(laser_angle, analyzer_angle)
+            if not any(cfg.DATA_DIR.glob(f"{step.POWER_LEVEL}_num*")):
+                print(f"\n[{step.POWER_LEVEL}] No files found. Skipping.")
+                continue
+            print(f"\n================ {step.POWER_LEVEL} "
+                  f"(laser {laser_angle:g} deg, analyzer {analyzer_angle:g} deg) ================")
             run_analysis(step)
 
 
@@ -361,11 +535,23 @@ def print_summary(cfg: ExperimentConfig, runs: List[Run]) -> None:
     print(f"data    : {cfg.DATA_DIR}")
     print(f"config  : {cfg.config_file_path().name}")
     print(f"results : {cfg.RESULTS_DIR}")
-    if cfg.is_polarization_scan() or cfg.POLARIZATION_POWERS:
-        print(f"pol root: {cfg.polarization_root}")
-        print(f"log     : {cfg.polarization_log_path().name}")
+    if cfg.is_ellipticity_scan():
+        print(f"ell root: {cfg.ellipticity_root}")
+        print(f"log     : {cfg.ellipticity_log_path().name}")
         if runs:
-            planned = len(cfg.polarization_scan_points()) * len(cfg.polarization_power_points())
+            planned = len(cfg.ellipticity_scan_points()) * len(cfg.pump_power_points())
+            print(f"points  : {len(runs)}/{planned} recorded "
+                  f"({len(cfg.ellipticity_laser_angles())} laser angles x "
+                  f"{len(cfg.ELLIPTICITY_ANALYZER_ANGLES)} analyzer angles)")
+        else:
+            print("mode    : analyze only (no acquisition)")
+        return
+
+    if cfg.is_laser_angle_scan() or cfg.PUMP_POWERS:
+        print(f"las root: {cfg.laser_angle_root}")
+        print(f"log     : {cfg.laser_angle_log_path().name}")
+        if runs:
+            planned = len(cfg.laser_angle_scan_points()) * len(cfg.pump_power_points())
             print(f"angles  : {len(runs)}/{planned} recorded")
         else:
             print("mode    : analyze only (no acquisition)")

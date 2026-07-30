@@ -107,17 +107,17 @@ POWER_SCAN = ExperimentConfig(
 
 
 # ----------------------------------------------------------------------------
-# 3. A polarization scan - one angle per acquisition, one power throughout
+# 3. A laser angle scan - one pump angle per acquisition, one power throughout
 # ----------------------------------------------------------------------------
-# The polarizer turns to the requested angle and the half-wave plate to whatever angle
-# the calibration table says delivers POLARIZATION_POWER there, so the power stays put
-# while the polarization turns. The table in polarization_calibration/ is reused as is;
-# recording a new one takes hours and is only needed after the beam path changes.
-# Results land under:
-#   results/.../polarization/{POWER}/summary/   ← the three circle plots
-#   results/.../polarization/{POWER}/angles/    ← per-angle analysis trees
+# The pump polarizer turns to the requested angle and the pump half-wave plate to
+# whatever angle the calibration table says delivers PUMP_POWER there, so the power
+# stays put while the polarization turns. The table in polarization_calibration/ is
+# reused as is; recording a new one takes hours and is only needed after the beam path
+# changes. Results land under:
+#   results/.../laser_angle/{POWER}/summary/   ← the four vs-angle plots
+#   results/.../laser_angle/{POWER}/angles/    ← per-angle analysis trees
 
-POLARIZATION_SCAN = ExperimentConfig(
+LASER_ANGLE_SCAN = ExperimentConfig(
     MATERIAL="ZnO100",
     EXPERIENCE_TYPE="David_Setup",
     DATE="27072026",
@@ -129,15 +129,15 @@ POLARIZATION_SCAN = ExperimentConfig(
     ACQUISITION_DURATION_S=300.0,           # x 24 angles: budget the whole scan
     CHUNK_DURATION_S=60.0,
 
-    POLARIZATION_SCAN=np.arange(0.0, 360.0, 15.0),
-    POLARIZATION_POWER=50.0,                # mW: the table's unit, not the label
-    POLARIZATION_CALIBRATION=None,          # None -> linear_polarization_lookup_latest.npz
-    POLARIZATION_CALIBRATION_DIR=None,      # None -> polarization_calibration/
-    POLARIZATION_STAGE_ENABLED=True,
-    POLARIZATION_P1=RotationStageConfig(serial_number="27260002", clockwise=True),
-    POLARIZATION_HWP=RotationStageConfig(serial_number="27260003", clockwise=True),
-    POLARIZATION_SETTLE_TIME_S=0.2,
-    POLARIZATION_STAGE_DRY_RUN=True,        # rehearse first, as above
+    LASER_ANGLE_SCAN=np.arange(0.0, 360.0, 15.0),
+    PUMP_POWER=50.0,                        # mW: the table's unit, not the label
+    PUMP_CALIBRATION=None,                  # None -> linear_polarization_lookup_latest.npz
+    PUMP_CALIBRATION_DIR=None,              # None -> polarization_calibration/
+    PUMP_STAGE_ENABLED=True,
+    PUMP_P1=RotationStageConfig(serial_number="27260002", clockwise=True),
+    PUMP_HWP=RotationStageConfig(serial_number="27260003", clockwise=True),
+    PUMP_SETTLE_TIME_S=0.2,
+    PUMP_STAGE_DRY_RUN=True,                # rehearse first, as above
 
     INTEGRATION_WINDOW=8,
     INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
@@ -146,23 +146,69 @@ POLARIZATION_SCAN = ExperimentConfig(
 
 
 # ----------------------------------------------------------------------------
-# 4. Multi-power polarization overlay (analyze only)
+# 4. An ellipticity scan - an analyzer sweep at each pump angle
 # ----------------------------------------------------------------------------
-# Record 25mW, 45mW, 65mW polarization scans in the SAME DATE folder (change
-# POWER_LEVEL + POLARIZATION_POWER between runs). Then rebuild every summary and
-# the butterfly overlay with all powers on each panel:
-#   results/.../polarization/25mW/summary/
-#   results/.../polarization/45mW/summary/
-#   results/.../polarization/65mW/summary/
-#   results/.../polarization/overlay/          ← intensity / g2 / harmonics
+# The pump mounts hold one laser angle while the half-wave plate AFTER the crystal turns
+# through its sweep in front of the fixed vertical polarizer. The intensity it transmits
+# traces a sinusoid of period 90 deg whose depth gives the ellipticity of the harmonics:
+# a curve reaching zero is a linear polarization, a flat one is circular.
+#
+# Three mounts move here, so all three serial numbers must be right:
+#   PUMP_P1 / PUMP_HWP  before the crystal, ELLIPTICITY_ANALYZER after it.
+# Results land under:
+#   results/.../ellipticity/{POWER}/las000p0/  ← that sweep and its fit
+#   results/.../ellipticity/{POWER}/summary/   ← ellipticity vs laser angle
 
-POLARIZATION_OVERLAY = ExperimentConfig(
+ELLIPTICITY_SCAN = ExperimentConfig(
+    MATERIAL="ZnO100",
+    EXPERIENCE_TYPE="David_Setup",
+    DATE="27072026",
+    POWER_LEVEL="50mW",                     # the label every point shares
+
+    MODES=MODES,
+    CORR_BINWIDTH_PS=300,
+    CORR_N_BINS=2009,
+    ACQUISITION_DURATION_S=120.0,           # x 4 laser angles x 12 analyzer angles
+    CHUNK_DURATION_S=30.0,
+
+    ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0, 135.0],
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),
+    ELLIPTICITY_ANALYZER_ENABLED=True,
+    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27260004", clockwise=True),
+    ELLIPTICITY_ANALYZER_DRY_RUN=True,      # rehearse first, as above
+    ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # a half-wave plate repeats every 90 deg
+    ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata: 0 = vertical
+
+    PUMP_POWER=50.0,
+    PUMP_STAGE_ENABLED=True,
+    PUMP_P1=RotationStageConfig(serial_number="27260002", clockwise=True),
+    PUMP_HWP=RotationStageConfig(serial_number="27260003", clockwise=True),
+    PUMP_STAGE_DRY_RUN=True,
+
+    INTEGRATION_WINDOW=8,
+    INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
+    RUN_ANALYSIS_AFTER_ACQUIRE=True,
+)
+
+
+# ----------------------------------------------------------------------------
+# 5. Multi-power laser angle overlay (analyze only)
+# ----------------------------------------------------------------------------
+# Record 25mW, 45mW, 65mW laser angle scans in the SAME DATE folder (change
+# POWER_LEVEL + PUMP_POWER between runs). Then rebuild every summary and the butterfly
+# overlay with all powers on each panel:
+#   results/.../laser_angle/25mW/summary/
+#   results/.../laser_angle/45mW/summary/
+#   results/.../laser_angle/65mW/summary/
+#   results/.../laser_angle/overlay/          ← intensity / g2 / R / harmonics
+
+LASER_ANGLE_OVERLAY = ExperimentConfig(
     MATERIAL="ZnO100",
     EXPERIENCE_TYPE="David_Setup",
     DATE="27072026",
     POWER_LEVEL="65mW",
-    POLARIZATION_SCAN=np.arange(0.0, 360.0, 15.0),
-    POLARIZATION_POWERS=["25mW", "45mW", "65mW"],
+    LASER_ANGLE_SCAN=np.arange(0.0, 360.0, 15.0),
+    PUMP_POWERS=["25mW", "45mW", "65mW"],
     MODES=MODES,
     FREQUENCY=18.66e6,
     INTEGRATION_WINDOW=8,
@@ -172,7 +218,7 @@ POLARIZATION_OVERLAY = ExperimentConfig(
 
 
 # ----------------------------------------------------------------------------
-# 5. Analysis only - no tagger, no mounts
+# 6. Analysis only - no tagger, no mounts
 # ----------------------------------------------------------------------------
 # Re-reads what is already in DATA_DIR. Listing several powers in POWER_LEVELS is what
 # produces power_sweep_summary/, so this is also how to compare powers that were
@@ -194,8 +240,9 @@ ANALYZE_ONLY = ExperimentConfig(
 EXAMPLES = {
     "single power": SINGLE_POWER,
     "power scan": POWER_SCAN,
-    "polarization scan": POLARIZATION_SCAN,
-    "polarization overlay": POLARIZATION_OVERLAY,
+    "laser angle scan": LASER_ANGLE_SCAN,
+    "ellipticity scan": ELLIPTICITY_SCAN,
+    "laser angle overlay": LASER_ANGLE_OVERLAY,
     "analysis only": ANALYZE_ONLY,
 }
 

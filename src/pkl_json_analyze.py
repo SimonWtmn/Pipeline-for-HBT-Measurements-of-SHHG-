@@ -1,19 +1,22 @@
 """The analysis: peaks, g2(0), R, and every figure the pipeline produces.
 
-Four families of output, all reading the same `.pkl`/`.json` files:
+Five families of output, all reading the same `.pkl`/`.json` files:
 
 * `run_analysis(cfg)` - the per-power tree: spectrograms, window sweeps, chunk
   statistics, and the power sweep summary when several powers are analysed.
 * `plot_stability(snapshots, cfg)` - g2(0) and R against time, from the snapshots a
   live run recorded while it was measuring.
-* `plot_polarization_summary(cfg)` - the four polar summaries of one power: intensity
+* `plot_laser_angle_summary(cfg)` - the four polar summaries of one power: intensity
   per harmonic, g²(0) per pair, R per cross pair, harmonics (intensity + auto-g²).
-* `plot_polarization_campaign(cfg)` - the same for every power in the folder, then
+* `plot_laser_angle_campaign(cfg)` - the same for every power in the folder, then
   the multi-power butterfly overlay.
+* `plot_ellipticity_campaign(cfg)` - the analyzer sweep recorded at each pump angle:
+  the same four summaries per pump angle, the sinusoid fitted to each, and the
+  ellipticity those fits give versus pump angle.
 
-The maths lives in one place: the stability and polarization halves reuse the same
-peak finding and the same g2 definition as the per-power tree, so a point on a polar
-figure is the number the per-angle tree would give for that angle.
+The maths lives in one place: the stability, laser-angle and ellipticity halves reuse
+the same peak finding and the same g2 definition as the per-power tree, so a point on a
+polar figure is the number the per-angle tree would give for that angle.
 """
 
 from pathlib import Path
@@ -39,19 +42,23 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
-    from experiment_config import ExperimentConfig, angle_tag, harmonic_of
-    from hardware import ScanLog
+    from experiment_config import (ExperimentConfig, analyzer_angle_tag, harmonic_of,
+                                   laser_angle_tag)
+    from hardware import EllipticityLog, LaserAngleLog
 except ImportError:  # pragma: no cover - import style depends on the entry point
-    from src.experiment_config import ExperimentConfig, angle_tag, harmonic_of
-    from src.hardware import ScanLog
+    from src.experiment_config import (ExperimentConfig, analyzer_angle_tag, harmonic_of,
+                                       laser_angle_tag)
+    from src.hardware import EllipticityLog, LaserAngleLog
 
 from dataclasses import replace
 
 script_path = Path(__file__).resolve().parent.parent
 
 Pair = Tuple[int, int]           # a channel pair, as the stability snapshots key them
-POLARIZATION_SUMMARY_CSV = "polarization_summary.csv"
-POLARIZATION_MINIMA_CSV = "interpolated_minima.csv"
+ANGLE_SUMMARY_CSV = "angle_summary.csv"
+ANGLE_MINIMA_CSV = "interpolated_minima.csv"
+ELLIPTICITY_FIT_CSV = "sinusoidal_fit.csv"
+ELLIPTICITY_SUMMARY_CSV = "ellipticity_vs_laser_angle.csv"
 BAND_ALPHA = 0.25                # opacity of the chunk-spread band on the polar plots
 ARM_COLORS = ("tab:orange", "tab:brown")   # the arms drawn beside a harmonic total
 SMOOTH_HARMONICS = ("H4",)       # harmonics drawn as a curve interpolated through the samples
@@ -1108,10 +1115,10 @@ def _save_stability_figure(fig, path: Path) -> None:
     plt.close(fig)
 
 # ============================================================================
-# POLARIZATION SCAN: CIRCLE / BUTTERFLY SUMMARIES VERSUS ANGLE
+# LASER ANGLE SCAN: CIRCLE / BUTTERFLY SUMMARIES VERSUS ANGLE
 # ============================================================================
 #
-# Four figures per power, under results/.../polarization/{power}/summary/:
+# Four figures per power, under results/.../laser_angle/{power}/summary/:
 #   1. intensity_vs_angle.png  — per HARMONIC (total + its two arms): polar on top,
 #                                  the same curves on linear axes below. The angles of
 #                                  the interpolated minima land in interpolated_minima.csv
@@ -1122,68 +1129,89 @@ def _save_stability_figure(fig, path: Path) -> None:
 #                                  (2×N grid → 4 panels for two harmonics, 6 for three)
 #
 # When several powers share a DATE folder, the same four layouts are redrawn under
-# results/.../polarization/overlay/ with every power as a coloured curve on each panel.
+# results/.../laser_angle/overlay/ with every power as a coloured curve on each panel.
+#
+# The four figures are written by `plot_angle_summary`, which knows nothing about WHICH
+# angle is on the axis: an ellipticity scan reuses them for its analyzer sweeps.
 
 
-def plot_polarization_summary(cfg: ExperimentConfig, results_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Write the four polar summaries for one power. Returns the series used."""
-    power = cfg.POLARIZATION_BASE_POWER or cfg.POWER_LEVEL
-    points = _polarization_points(cfg, power=power)
+def plot_laser_angle_summary(cfg: ExperimentConfig,
+                             results_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Write the four polar summaries versus pump angle for one power."""
+    power = cfg.base_power
+    points = _laser_angle_points(cfg, power=power)
     if not points:
-        print(f"Polarization summary [{power}]: no angles configured.")
+        print(f"Laser angle summary [{power}]: no angles configured.")
         return None
 
-    series = collect_polarization_series(cfg, points, power_label=power)
+    series = collect_angle_series(cfg, points, power_label=power, angle_name="laser angle")
     if len(series["angles"]) < 2:
-        print(f"Polarization summary [{power}]: fewer than 2 angles with data, nothing to plot.")
+        print(f"Laser angle summary [{power}]: fewer than 2 angles with data, nothing to plot.")
         return None
 
-    save_dir = Path(results_dir) if results_dir else cfg.polarization_summary_dir(power)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    plot_polarization_intensity(series, save_dir)
-    plot_polarization_g2(series, save_dir)
-    plot_polarization_r(series, save_dir)
-    plot_polarization_harmonics(series, save_dir)
-    # write_polarization_csv(series, save_dir / POLARIZATION_SUMMARY_CSV)
-
-    print(f"Polarization summary [{power}]: {len(series['angles'])} angles -> {save_dir}")
+    save_dir = Path(results_dir) if results_dir else cfg.laser_angle_summary_dir(power)
+    plot_angle_summary(series, save_dir)
+    print(f"Laser angle summary [{power}]: {len(series['angles'])} angles -> {save_dir}")
     return series
 
 
-def plot_polarization_campaign(cfg: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
-    """Per-power summaries for every polarization power in the folder, then the overlay.
+def plot_angle_summary(series: Dict[str, Any], save_dir: Path) -> Path:
+    """The four vs-angle figures of one series, whatever angle it scanned."""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    plot_angle_intensity(series, save_dir)
+    plot_angle_g2(series, save_dir)
+    plot_angle_r(series, save_dir)
+    plot_angle_harmonics(series, save_dir)
+    return save_dir
 
-    Powers come from `POLARIZATION_POWERS` when set, otherwise from the files on disk
-    (and falling back to the single `POWER_LEVEL` of this config).
+
+def plot_laser_angle_campaign(cfg: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
+    """Per-power summaries for every power in the folder, then the overlay.
+
+    Powers come from `PUMP_POWERS` when set, otherwise from the files on disk (and
+    falling back to the single `POWER_LEVEL` of this config).
     """
-    powers = list(cfg.POLARIZATION_POWERS) if cfg.POLARIZATION_POWERS else discover_polarization_powers(cfg.DATA_DIR)
+    powers = list(cfg.PUMP_POWERS) if cfg.PUMP_POWERS else discover_laser_angle_powers(cfg.DATA_DIR)
     if not powers:
         powers = [cfg.POWER_LEVEL]
 
     series_by_power: Dict[str, Dict[str, Any]] = {}
     for power in powers:
-        power_cfg = cfg.for_polarization_power(power)
-        if cfg.POLARIZATION_SCAN is not None:
+        power_cfg = cfg.for_pump_power(power)
+        if cfg.LASER_ANGLE_SCAN is not None:
             # Keep the planned angles so a folder can be replotted without the CSV log.
-            power_cfg = replace(power_cfg, POLARIZATION_SCAN=list(cfg.POLARIZATION_SCAN))
-        series = plot_polarization_summary(power_cfg)
+            power_cfg = replace(power_cfg, LASER_ANGLE_SCAN=list(cfg.LASER_ANGLE_SCAN))
+        series = plot_laser_angle_summary(power_cfg)
         if series is not None:
             series_by_power[power] = series
 
     if len(series_by_power) > 1:
-        plot_polarization_overlay(series_by_power, cfg.polarization_overlay_dir)
+        plot_laser_angle_overlay(series_by_power, cfg.laser_angle_overlay_dir)
     elif len(series_by_power) == 1:
-        print("Polarization overlay: only one power present, skipped.")
+        print("Laser angle overlay: only one power present, skipped.")
 
     return series_by_power
 
 
-def discover_polarization_powers(data_dir: Path) -> List[str]:
-    """Power labels that have at least one `{power}_polXXX_num*.pkl` in the folder."""
+def discover_laser_angle_powers(data_dir: Path) -> List[str]:
+    """Power labels that have at least one `{power}_lasXXX_num*` file in the folder.
+
+    The `_num` anchor is what keeps an ellipticity scan's `{power}_lasXXX_hwpYYY_num*`
+    files out of the list when both scans share a DATE folder.
+    """
+    return _discover_powers(data_dir, "*_las*_num*", r"(.+)_las\d{3}p\d_num")
+
+
+def discover_ellipticity_powers(data_dir: Path) -> List[str]:
+    """Power labels that have at least one `{power}_lasXXX_hwpYYY_num*` file."""
+    return _discover_powers(data_dir, "*_las*_hwp*_num*", r"(.+)_las\d{3}p\d_hwp\d{3}p\d_num")
+
+
+def _discover_powers(data_dir: Path, glob: str, pattern: str) -> List[str]:
     found: List[str] = []
-    for path in Path(data_dir).glob("*_pol*_num*"):
-        match = re.match(r"(.+)_pol\d{3}p\d", path.name)
+    for path in Path(data_dir).glob(glob):
+        match = re.match(pattern, path.name)
         if match and match.group(1) not in found:
             found.append(match.group(1))
     return sorted(found, key=_power_sort_key)
@@ -1194,17 +1222,18 @@ def _power_sort_key(power: str) -> float:
     return float(digits) if digits else 0.0
 
 
-def _polarization_points(cfg: ExperimentConfig, power: Optional[str] = None) -> List[Tuple[float, str]]:
+def _laser_angle_points(cfg: ExperimentConfig, power: Optional[str] = None) -> List[Tuple[float, str]]:
     """Angles to summarise for one power: CSV log first, else the planned scan."""
-    power = power or cfg.POLARIZATION_BASE_POWER or cfg.POWER_LEVEL
-    log_path = cfg.polarization_log_path()
+    power = power or cfg.base_power
+    log_path = cfg.laser_angle_log_path()
     if log_path.is_file():
-        recorded = ScanLog(log_path).recorded_labels(power=power)
+        recorded = LaserAngleLog(log_path).recorded_labels(power=power)
         if recorded:
             return recorded
     # Rebuild labels for this power even if cfg.POWER_LEVEL was rewritten.
-    if cfg.POLARIZATION_SCAN is not None:
-        return [(float(angle), f"{power}_{angle_tag(angle)}") for angle in cfg.POLARIZATION_SCAN]
+    if cfg.LASER_ANGLE_SCAN is not None:
+        return [(float(angle), f"{power}_{laser_angle_tag(angle)}")
+                for angle in cfg.LASER_ANGLE_SCAN]
     return []
 
 
@@ -1212,9 +1241,15 @@ def _polarization_points(cfg: ExperimentConfig, power: Optional[str] = None) -> 
 # Loading and averaging
 # ----------------------------------------------------------------------------
 
-def collect_polarization_series(cfg: ExperimentConfig, points: Sequence[Tuple[float, str]],
-                                power_label: str) -> Dict[str, Any]:
-    """Mean and std over the chunks of each angle, for one power."""
+def collect_angle_series(cfg: ExperimentConfig, points: Sequence[Tuple[float, str]],
+                         power_label: str, angle_name: str = "angle",
+                         title: Optional[str] = None) -> Dict[str, Any]:
+    """Mean and std over the chunks of each angle of one scan.
+
+    `points` is [(angle, file label)]; `angle_name` names the axis ("laser angle",
+    "analyzer angle") and `title` overrides what the figures are labelled with, so an
+    ellipticity sweep can say which pump angle it belongs to.
+    """
     angles: List[float] = []
     n_chunks: List[int] = []
     channels: Dict[str, List[Tuple[float, float]]] = {}
@@ -1223,7 +1258,7 @@ def collect_polarization_series(cfg: ExperimentConfig, points: Sequence[Tuple[fl
     harmonics: Dict[str, List[Tuple[float, float]]] = {}
 
     for angle, label in points:
-        chunk_data = _load_polarization_angle(cfg, label)
+        chunk_data = _load_angle_point(cfg, label)
         if not chunk_data:
             print(f"  [{label}] no files found, angle skipped.")
             continue
@@ -1261,12 +1296,21 @@ def collect_polarization_series(cfg: ExperimentConfig, points: Sequence[Tuple[fl
         "R": _series_arrays(r_values, order),
         "harmonics": _series_arrays(harmonics, order),
         "power_label": power_label,
-        "clockwise": cfg.POLARIZATION_P1.clockwise if cfg.POLARIZATION_P1 else True,
+        "angle_name": angle_name,
+        "title": title or power_label,
+        "clockwise": cfg.PUMP_P1.clockwise if cfg.PUMP_P1 else True,
     }
 
 
-def _load_polarization_angle(cfg: ExperimentConfig, label: str) -> Dict[str, Any]:
-    merged_files, chunk_files = get_files(cfg.DATA_DIR, pattern=f"*{label}*")
+def _load_angle_point(cfg: ExperimentConfig, label: str) -> Dict[str, Any]:
+    """The chunks of one point of a scan, keyed as the per-power tree keys them.
+
+    The `_num` / `_merged` anchors matter: a bare `*{label}*` glob would also pick up
+    every `{label}_hwpYYY` file of an ellipticity scan sharing the folder, and average a
+    whole analyzer sweep into the point.
+    """
+    _merged, chunk_files = get_files(cfg.DATA_DIR, pattern=f"*{label}_num*")
+    merged_files, _chunks = get_files(cfg.DATA_DIR, pattern=f"*{label}_merged*")
     files = chunk_files or merged_files
     if not files:
         return {}
@@ -1552,6 +1596,23 @@ def _draw_curve(ax, angles: np.ndarray, mean: np.ndarray, color: str, label: Opt
     ax.plot(to_x(angles), mean, color=color, marker="o", markersize=markersize, linestyle="none")
 
 
+def _draw_sinusoid(ax, fit: Dict[str, Any], angles: np.ndarray, to_x=None,
+                   color: str = "0.15") -> None:
+    """The fitted sinusoid over the drawn angle range, labelled with what it measures.
+
+    Drawn instead of the cubic spline of SMOOTH_HARMONICS: an analyzer sweep is a
+    sinusoid by construction, so the fit IS the curve, and its depth is the number the
+    ellipticity comes from.
+    """
+    to_x = to_x if to_x is not None else (lambda degrees: degrees)
+    dense = np.linspace(float(angles[0]), float(angles[-1]), 361)
+    values = np.clip(sinusoid(dense, fit), 0.0, None)
+    label = (f"fit: m={fit['modulation']:.3f}, "
+             f"$\\epsilon$={fit['ellipticity']:.3f}")
+    ax.plot(to_x(dense), values, color=color, linestyle="--", linewidth=1.4,
+            label=label, zorder=4)
+
+
 def _mark_minima(ax, minima: Sequence[Tuple[float, float]], color: str = "0.2",
                  to_x=None, annotate: bool = False, label: Optional[str] = None) -> None:
     """Ring the interpolated minima, and on a linear panel write the angle of each."""
@@ -1581,9 +1642,10 @@ def _polar_style(ax, title: str, clockwise: bool = True) -> None:
     ax.tick_params(labelsize=7)
 
 
-def _linear_style(ax, title: str, ylabel: str, angles: np.ndarray) -> None:
+def _linear_style(ax, title: str, ylabel: str, angles: np.ndarray,
+                  angle_name: str = "angle") -> None:
     ax.set_title(title, fontsize=10, fontweight="bold", pad=8)
-    ax.set_xlabel("polarization angle (deg)", fontsize=8)
+    ax.set_xlabel(f"{angle_name} (deg)", fontsize=8)
     ax.set_ylabel(ylabel, fontsize=8)
     first, last = float(angles[0]), float(angles[-1])
     ax.set_xlim(first, last)
@@ -1660,7 +1722,7 @@ def _power_legend(fig, colors: Dict[str, Any]) -> None:
 # The four figures (single power)
 # ----------------------------------------------------------------------------
 
-def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
+def plot_angle_intensity(series: Dict[str, Any], save_dir: Path) -> None:
     """Per harmonic: the polar butterfly on top, the same curves on linear axes below.
 
     Each column carries the harmonic total (the sum of its arms, as in
@@ -1671,21 +1733,27 @@ def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
     The interpolation of SMOOTH_HARMONICS is applied to the sum only, and its minima are
     ringed on both rows, labelled with their angle on the linear one, and written to
     interpolated_minima.csv beside the figure.
+
+    An ellipticity sweep also carries `series["fits"]`: the sinusoid fitted to each
+    harmonic total is then drawn on the linear panel, with the modulation and the
+    ellipticity it gives, since that curve is the measurement.
     """
     harmonics = sorted(series["harmonics"])
     if not harmonics:
         return
 
+    angle_name = series.get("angle_name", "angle")
+    fits = series.get("fits") or {}
     arms_of = {harmonic: sorted(name for name in series["channels"] if harmonic_of(name) == harmonic)
                for harmonic in harmonics}
     fig, polar_axes, linear_axes = _two_row_grid(
-        len(harmonics), f"Intensity vs polarization angle — {series['power_label']}")
+        len(harmonics), f"Intensity vs {angle_name} — {series.get('title', series['power_label'])}")
     circle_angles = _circle_arrays(series["angles"])[0]
     minima_rows: List[Dict[str, Any]] = []
 
     for column, harmonic in enumerate(harmonics):
         total = series["harmonics"][harmonic]
-        smooth = harmonic in SMOOTH_HARMONICS
+        smooth = harmonic in SMOOTH_HARMONICS and harmonic not in fits
         for ax, draw in ((polar_axes[column], _polar_series), (linear_axes[column], _linear_series)):
             draw(ax, series["angles"], total["mean"], total["std"], "tab:blue",
                  label=f"{harmonic} total", smooth=smooth, floor=0.0)
@@ -1701,16 +1769,21 @@ def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
                          label="interpolated minimum")
             minima_rows.extend(_minima_rows(series["power_label"], harmonic, total["mean"], minima))
 
+        fit = fits.get(harmonic)
+        if fit is not None:
+            _draw_sinusoid(linear_axes[column], fit, circle_angles)
+            _draw_sinusoid(polar_axes[column], fit, circle_angles, to_x=np.deg2rad)
+
         curves = [total["mean"]] + [series["channels"][name]["mean"] for name in arms_of[harmonic]]
         _focus_radial(polar_axes[column], curves, floor=0.0)
         _polar_style(polar_axes[column], f"{harmonic} intensity (counts/s)", series["clockwise"])
         _focus_vertical(linear_axes[column], curves, floor=0.0)
         _linear_style(linear_axes[column], f"{harmonic} intensity — linear axes",
-                      "counts/s", circle_angles)
+                      "counts/s", circle_angles, angle_name)
         linear_axes[column].legend(fontsize=7, loc="best", framealpha=0.8)
 
     _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
-    write_minima_csv(minima_rows, save_dir / POLARIZATION_MINIMA_CSV)
+    write_minima_csv(minima_rows, save_dir / ANGLE_MINIMA_CSV)
 
 
 def _harmonic_minima(series: Dict[str, Any], harmonic: str) -> List[Tuple[float, float]]:
@@ -1735,7 +1808,7 @@ def _minima_rows(power_label: str, harmonic: str, mean: np.ndarray,
     } for angle, value in minima]
 
 
-def plot_polarization_g2(series: Dict[str, Any], save_dir: Path) -> None:
+def plot_angle_g2(series: Dict[str, Any], save_dir: Path) -> None:
     """g²(0) vs angle: one row per harmonic, its auto pair first, then a cross family.
 
     Row by row that reads 33 | all 34, 44 | all 35, 55 | all 45.
@@ -1745,7 +1818,8 @@ def plot_polarization_g2(series: Dict[str, Any], save_dir: Path) -> None:
         return
     fig, ax_by_pair = _row_grid(
         _auto_then_cross_rows(pairs),
-        f"$g^{{(2)}}(0)$ vs polarization angle — {series['power_label']}")
+        f"$g^{{(2)}}(0)$ vs {series.get('angle_name', 'angle')} — "
+        f"{series.get('title', series['power_label'])}")
     for pair, ax in ax_by_pair.items():
         color = "tab:red" if is_cross_harmonic(pair) else "tab:green"
         _polar_series(ax, series["angles"], pairs[pair]["mean"], pairs[pair]["std"], color)
@@ -1755,7 +1829,7 @@ def plot_polarization_g2(series: Dict[str, Any], save_dir: Path) -> None:
     _save_polar_figure(fig, save_dir / "g2_vs_angle.png")
 
 
-def plot_polarization_r(series: Dict[str, Any], save_dir: Path) -> None:
+def plot_angle_r(series: Dict[str, Any], save_dir: Path) -> None:
     """R = g²_cross² / (g²_auto g²_auto) vs angle: one row per cross family (34, 35, 45).
 
     R is only defined for cross pairs, so there is no auto column here.
@@ -1765,8 +1839,8 @@ def plot_polarization_r(series: Dict[str, Any], save_dir: Path) -> None:
         return
     fig, ax_by_pair = _row_grid(
         _cross_family_rows(r_values),
-        f"$R = g^{{(2)}}_{{nm}}{{}}^2 / (g^{{(2)}}_{{nn}} g^{{(2)}}_{{mm}})$ vs polarization "
-        f"angle — {series['power_label']}")
+        f"$R = g^{{(2)}}_{{nm}}{{}}^2 / (g^{{(2)}}_{{nn}} g^{{(2)}}_{{mm}})$ vs "
+        f"{series.get('angle_name', 'angle')} — {series.get('title', series['power_label'])}")
     for pair, ax in ax_by_pair.items():
         _polar_series(ax, series["angles"], r_values[pair]["mean"], r_values[pair]["std"],
                       "tab:purple")
@@ -1776,7 +1850,7 @@ def plot_polarization_r(series: Dict[str, Any], save_dir: Path) -> None:
     _save_polar_figure(fig, save_dir / "R_vs_angle.png")
 
 
-def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
+def plot_angle_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
     """2×N polar grid: per harmonic, intensity on top and its auto-g²(0) below.
 
     Two harmonics → 4 panels; three harmonics → 6 panels.
@@ -1791,12 +1865,13 @@ def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
     fig, axes = plt.subplots(2, cols, figsize=(4.4 * cols, 9.0), dpi=300,
                              subplot_kw={"projection": "polar"})
     axes = np.asarray(axes).reshape(2, cols)
-    fig.suptitle(f"Harmonics vs polarization angle — {series['power_label']}",
+    fig.suptitle(f"Harmonics vs {series.get('angle_name', 'angle')} — "
+                 f"{series.get('title', series['power_label'])}",
                  fontsize=15, fontweight="bold")
 
     for column, harmonic in enumerate(harmonics):
         signal = series["harmonics"][harmonic]
-        smooth = harmonic in SMOOTH_HARMONICS
+        smooth = harmonic in SMOOTH_HARMONICS and harmonic not in (series.get("fits") or {})
         _polar_series(axes[0, column], series["angles"], signal["mean"], signal["std"], "tab:blue",
                       smooth=smooth, floor=0.0)
         if smooth:
@@ -1822,7 +1897,7 @@ def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
 # Multi-power butterfly overlay
 # ----------------------------------------------------------------------------
 
-def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_dir: Path) -> None:
+def plot_laser_angle_overlay(series_by_power: Dict[str, Dict[str, Any]], save_dir: Path) -> None:
     """Same four layouts, every power drawn on each panel as a coloured butterfly.
 
     The arm curves of the intensity figure are dropped here: with one colour per power
@@ -1836,14 +1911,16 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
     save_dir.mkdir(parents=True, exist_ok=True)
     powers = list(series_by_power)
     colors = _power_colors(powers)
-    clockwise = next(iter(series_by_power.values())).get("clockwise", True)
+    first = next(iter(series_by_power.values()))
+    clockwise = first.get("clockwise", True)
+    angle_name = first.get("angle_name", "angle")
     title_suffix = ", ".join(powers)
 
     # --- intensity: per harmonic, polar on top and the same curves linear below ---
     harmonics = sorted({h for series in series_by_power.values() for h in series["harmonics"]})
     if harmonics:
         fig, polar_axes, linear_axes = _two_row_grid(
-            len(harmonics), f"Intensity vs polarization angle — {title_suffix}")
+            len(harmonics), f"Intensity vs {angle_name} — {title_suffix}")
         minima_rows: List[Dict[str, Any]] = []
         for column, harmonic in enumerate(harmonics):
             smooth = harmonic in SMOOTH_HARMONICS
@@ -1874,16 +1951,16 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
             _focus_vertical(linear_axes[column], curves, floor=0.0)
             if widest is not None:
                 _linear_style(linear_axes[column], f"{harmonic} intensity — linear axes",
-                              "counts/s", widest)
+                              "counts/s", widest, angle_name)
         _power_legend(fig, colors)
         _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
-        write_minima_csv(minima_rows, save_dir / POLARIZATION_MINIMA_CSV)
+        write_minima_csv(minima_rows, save_dir / ANGLE_MINIMA_CSV)
 
     # --- g2: one row per harmonic, its auto pair then a cross family ---
     pair_names = sorted({pair for series in series_by_power.values() for pair in series["pairs"]})
     if pair_names:
         fig, ax_by_pair = _row_grid(_auto_then_cross_rows(pair_names),
-                                    f"$g^{{(2)}}(0)$ vs polarization angle — {title_suffix}")
+                                    f"$g^{{(2)}}(0)$ vs {angle_name} — {title_suffix}")
         for pair, ax in ax_by_pair.items():
             curves = _overlay_panel(ax, series_by_power, "pairs", pair, colors)
             _unity_circle(ax)
@@ -1897,8 +1974,8 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
     if r_names:
         fig, ax_by_pair = _row_grid(
             _cross_family_rows(r_names),
-            f"$R = g^{{(2)}}_{{nm}}{{}}^2 / (g^{{(2)}}_{{nn}} g^{{(2)}}_{{mm}})$ vs polarization "
-            f"angle — {title_suffix}")
+            f"$R = g^{{(2)}}_{{nm}}{{}}^2 / (g^{{(2)}}_{{nn}} g^{{(2)}}_{{mm}})$ vs "
+            f"{angle_name} — {title_suffix}")
         for pair, ax in ax_by_pair.items():
             curves = _overlay_panel(ax, series_by_power, "R", pair, colors)
             _unity_circle(ax)
@@ -1913,7 +1990,7 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
         fig, axes = plt.subplots(2, cols, figsize=(4.4 * cols, 9.0), dpi=300,
                                  subplot_kw={"projection": "polar"})
         axes = np.asarray(axes).reshape(2, cols)
-        fig.suptitle(f"Harmonics vs polarization angle — {title_suffix}",
+        fig.suptitle(f"Harmonics vs {angle_name} — {title_suffix}",
                      fontsize=15, fontweight="bold")
         for column, harmonic in enumerate(harmonics):
             curves = []
@@ -1950,7 +2027,7 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
         _power_legend(fig, colors)
         _save_polar_figure(fig, save_dir / "harmonics_vs_angle.png")
 
-    print(f"Polarization overlay ({len(powers)} powers) -> {save_dir}")
+    print(f"Laser angle overlay ({len(powers)} powers) -> {save_dir}")
 
 
 def _overlay_panel(ax, series_by_power: Dict[str, Dict[str, Any]], key: str,
@@ -1987,12 +2064,13 @@ def write_minima_csv(rows: Sequence[Dict[str, Any]], path: Path) -> Optional[Pat
     return path
 
 
-def write_polarization_csv(series: Dict[str, Any], path: Path) -> Path:
+def write_angle_summary_csv(series: Dict[str, Any], path: Path) -> Path:
+    """Every quantity of every angle of one series, one row per (angle, quantity)."""
     rows = []
     for angle_index, angle in enumerate(series["angles"]):
         common = {
             "power_label": series["power_label"],
-            "polarization_angle_deg": f"{angle:g}",
+            "angle_deg": f"{angle:g}",
             "n_chunks": int(series["n_chunks"][angle_index]),
         }
         for quantity, entries in (("countrate", series["channels"]),
@@ -2012,13 +2090,521 @@ def write_polarization_csv(series: Dict[str, Any], path: Path) -> Path:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["power_label", "polarization_angle_deg", "quantity", "target",
+            fieldnames=["power_label", "angle_deg", "quantity", "target",
                         "mean", "std", "n_chunks"],
         )
         writer.writeheader()
         writer.writerows(rows)
     print(f"  {path.name}")
     return path
+
+
+# ============================================================================
+# ELLIPTICITY SCAN: THE ANALYZER SWEEP RECORDED AT EACH LASER ANGLE
+# ============================================================================
+#
+# The harmonics leave the crystal, pass a half-wave plate, then a polarizer that never
+# moves. Turning the plate turns the polarization in front of that polarizer, so the
+# intensity it transmits traces a sinusoid of period 90 deg in plate angle:
+#
+#     I(theta) = offset + amplitude * cos(2*pi*(theta - phase) / 90 deg)
+#
+# What the shape says about the emission is entirely in the DEPTH of that sinusoid:
+#
+#   * a curve reaching zero  -> one axis carries nothing         -> linear
+#   * a flat curve           -> both axes carry the same         -> circular
+#
+# Written as the modulation m = amplitude / offset, and the two intensities the fit
+# reaches, I_max = offset + amplitude and I_min = offset - amplitude:
+#
+#     attenuation = I_min / I_max = (1 - m) / (1 + m)
+#     ellipticity = sqrt(attenuation)      i.e. the ratio of the ellipse's axes
+#
+# so ellipticity 0 is linear and 1 is circular. Repeating the sweep at several pump
+# (laser) angles is what gives ellipticity versus laser angle, the point of the scan.
+#
+# Per power, under results/.../ellipticity/{power}/:
+#   lasXXXpY/  — the four vs-analyzer-angle figures of that sweep, the fitted sinusoid
+#                  drawn on the intensity panels, and sinusoidal_fit.csv
+#   summary/   — ellipticity_vs_laser_angle.png / .csv, modulation_vs_laser_angle.png,
+#                  sinusoid_fits_{harmonic}.png (every sweep and its fit side by side),
+#                  and the sinusoidal_fit.csv of the whole power
+#   ../overlay/ — ellipticity and modulation versus laser angle, every power together
+
+
+def sinusoid(angles_deg: np.ndarray, fit: Dict[str, Any]) -> np.ndarray:
+    """The fitted curve evaluated at `angles_deg`."""
+    phase = 2.0 * np.pi * (np.asarray(angles_deg, dtype=float) - fit["phase_deg"]) / fit["period_deg"]
+    return fit["offset"] + fit["amplitude"] * np.cos(phase)
+
+
+def fit_sinusoid(angles_deg: Sequence[float], values: Sequence[float],
+                 period_deg: float = 90.0) -> Optional[Dict[str, Any]]:
+    """Fit `offset + amplitude*cos(2 pi (angle - phase)/period)` at a FIXED period.
+
+    Holding the period at the 90 deg a half-wave plate imposes leaves three linear
+    parameters, so the fit is a least-squares solve rather than an iteration that can
+    fail to converge on a nearly flat (circular) curve. The uncertainties are the usual
+    residual-based ones, propagated into the modulation and the ellipticity.
+
+    Returns None when fewer than four angles carry a finite value.
+    """
+    angles = np.asarray(angles_deg, dtype=float)
+    signal = np.asarray(values, dtype=float)
+    finite = np.isfinite(angles) & np.isfinite(signal)
+    if finite.sum() < 4:
+        return None
+    angles, signal = angles[finite], signal[finite]
+
+    turns = 2.0 * np.pi * angles / float(period_deg)
+    design = np.column_stack([np.cos(turns), np.sin(turns), np.ones_like(turns)])
+    (cosine, sine, offset), *_ = np.linalg.lstsq(design, signal, rcond=None)
+    amplitude = float(np.hypot(cosine, sine))
+    phase_deg = float(np.rad2deg(np.arctan2(sine, cosine)) * period_deg / 360.0 % period_deg)
+
+    residuals = signal - design @ np.array([cosine, sine, offset])
+    rss = float(residuals @ residuals)
+    total = float(np.sum((signal - signal.mean()) ** 2))
+    dof = len(signal) - 3
+    covariance = np.linalg.pinv(design.T @ design) * (rss / dof if dof > 0 else np.nan)
+
+    # The amplitude is not a fitted parameter but the length of (cosine, sine), so its
+    # variance - and its covariance with the offset - come from that of the two.
+    if amplitude > 0:
+        amplitude_var = float(
+            cosine ** 2 * covariance[0, 0] + sine ** 2 * covariance[1, 1]
+            + 2.0 * cosine * sine * covariance[0, 1]) / amplitude ** 2
+        amplitude_offset_cov = float(cosine * covariance[0, 2] + sine * covariance[1, 2]) / amplitude
+    else:
+        amplitude_var = amplitude_offset_cov = float("nan")
+
+    modulation = amplitude / offset if offset > 0 else float("nan")
+    modulation_var = (modulation ** 2 * (amplitude_var / amplitude ** 2
+                                         + covariance[2, 2] / offset ** 2
+                                         - 2.0 * amplitude_offset_cov / (amplitude * offset))
+                      if offset > 0 and amplitude > 0 else float("nan"))
+    modulation_std = float(np.sqrt(modulation_var)) if modulation_var >= 0 else float("nan")
+    attenuation, ellipticity, ellipticity_std = ellipticity_of(modulation, modulation_std)
+
+    return {
+        "n_points": int(len(signal)),
+        "period_deg": float(period_deg),
+        "offset": float(offset),
+        "amplitude": amplitude,
+        "phase_deg": phase_deg,
+        "modulation": float(modulation),
+        "modulation_std": modulation_std,
+        "ellipticity": ellipticity,
+        "ellipticity_std": ellipticity_std,
+        "attenuation": attenuation,
+        "mean_intensity": float(offset),
+        "r_squared": float(1.0 - rss / total) if total > 0 else float("nan"),
+        "rmse": float(np.sqrt(rss / len(signal))),
+    }
+
+
+def ellipticity_of(modulation: float, modulation_std: float = float("nan")) -> Tuple[float, float, float]:
+    """(attenuation, ellipticity, ellipticity std) of a modulation depth.
+
+    attenuation = I_min/I_max = (1-m)/(1+m), and the ellipticity is its square root: the
+    ratio of the ellipse's axes, 0 for a linear polarization and 1 for a circular one.
+    Noise can push a fitted m just past 1 (a curve reaching slightly below zero), which
+    is a linear polarization measured with a small negative excursion: it is clipped to
+    0 rather than turned into a NaN.
+    """
+    if not np.isfinite(modulation):
+        return float("nan"), float("nan"), float("nan")
+    attenuation = float(np.clip((1.0 - modulation) / (1.0 + modulation), 0.0, 1.0))
+    ellipticity = float(np.sqrt(attenuation))
+    if ellipticity > 0 and np.isfinite(modulation_std):
+        # d(eps)/dm = -1 / ((1+m)^2 eps)
+        ellipticity_std = float(modulation_std / ((1.0 + modulation) ** 2 * ellipticity))
+    else:
+        ellipticity_std = float("nan")
+    return attenuation, ellipticity, ellipticity_std
+
+
+def fit_angle_series(series: Dict[str, Any], period_deg: float = 90.0) -> Dict[str, Dict[str, Any]]:
+    """Fit the sinusoid of every harmonic total and every single channel of a sweep.
+
+    The harmonic totals are what the ellipticity is quoted from; the per-channel fits
+    are kept because a transmitted and a reflected arm disagreeing is how a
+    mis-set analyzer or a clipped beam shows up.
+    """
+    fits: Dict[str, Dict[str, Any]] = {"harmonics": {}, "channels": {}}
+    for kind, key in (("harmonics", "harmonics"), ("channels", "channels")):
+        for name, entry in sorted(series[key].items()):
+            fit = fit_sinusoid(series["angles"], entry["mean"], period_deg)
+            if fit is not None:
+                fits[kind][name] = fit
+    return fits
+
+
+# ----------------------------------------------------------------------------
+# One power: every sweep, then ellipticity versus laser angle
+# ----------------------------------------------------------------------------
+
+def plot_ellipticity_power(cfg: ExperimentConfig,
+                           power: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Every analyzer sweep of one power, its fit, and the summary versus laser angle."""
+    power = power or cfg.base_power
+    period = float(cfg.ELLIPTICITY_FIT_PERIOD_DEG)
+    laser_angles = _ellipticity_laser_angles(cfg, power)
+    if not laser_angles:
+        print(f"Ellipticity [{power}]: no laser angles configured.")
+        return None
+
+    sweeps: List[Dict[str, Any]] = []
+    fit_rows: List[Dict[str, Any]] = []
+    for laser_angle in laser_angles:
+        points = _ellipticity_points(cfg, power, laser_angle)
+        series = collect_angle_series(cfg, points, power_label=power,
+                                      angle_name="analyzer angle",
+                                      title=f"{power}, laser angle {laser_angle:g}°")
+        if len(series["angles"]) < 4:
+            print(f"  [{power} @ {laser_angle:g}°] fewer than 4 analyzer angles with data, "
+                  "sweep skipped.")
+            continue
+
+        fits = fit_angle_series(series, period)
+        series["fits"] = fits["harmonics"]
+        save_dir = cfg.ellipticity_laser_dir(power, laser_angle)
+        print(f"\n  ---- {power}, laser angle {laser_angle:g}° "
+              f"({len(series['angles'])} analyzer angles) ----")
+        plot_angle_summary(series, save_dir)
+
+        rows = _fit_rows(power, laser_angle, fits)
+        write_sinusoid_csv(rows, save_dir / ELLIPTICITY_FIT_CSV)
+        fit_rows.extend(rows)
+        sweeps.append({"laser_angle_deg": float(laser_angle), "series": series,
+                       "fits": fits["harmonics"]})
+        for harmonic, fit in sorted(fits["harmonics"].items()):
+            print(f"    {harmonic}: modulation {fit['modulation']:.4f}, "
+                  f"ellipticity {fit['ellipticity']:.4f} "
+                  f"(R² {fit['r_squared']:.4f})")
+
+    if not sweeps:
+        print(f"Ellipticity [{power}]: no sweep held enough data.")
+        return None
+
+    summary_dir = cfg.ellipticity_summary_dir(power)
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  ---- {power} summary ----")
+    plot_ellipticity_vs_laser_angle(sweeps, power, summary_dir)
+    plot_modulation_vs_laser_angle(sweeps, power, summary_dir)
+    for harmonic in sorted({h for sweep in sweeps for h in sweep["fits"]}):
+        plot_sinusoid_fits(sweeps, harmonic, power, summary_dir)
+    write_ellipticity_csv(sweeps, power, summary_dir / ELLIPTICITY_SUMMARY_CSV)
+    write_sinusoid_csv(fit_rows, summary_dir / ELLIPTICITY_FIT_CSV)
+
+    print(f"Ellipticity [{power}]: {len(sweeps)} laser angle(s) -> {summary_dir.parent}")
+    return {"power_label": power, "sweeps": sweeps}
+
+
+def plot_ellipticity_campaign(cfg: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
+    """Every power of the folder, then the overlay comparing them.
+
+    Powers come from `PUMP_POWERS` when set, otherwise from the files on disk (and
+    falling back to the single `POWER_LEVEL` of this config).
+    """
+    powers = list(cfg.PUMP_POWERS) if cfg.PUMP_POWERS else discover_ellipticity_powers(cfg.DATA_DIR)
+    if not powers:
+        powers = [cfg.POWER_LEVEL]
+
+    by_power: Dict[str, Dict[str, Any]] = {}
+    for power in powers:
+        print(f"\n================ ellipticity: {power} ================")
+        campaign = plot_ellipticity_power(cfg.for_pump_power(power), power)
+        if campaign is not None:
+            by_power[power] = campaign
+
+    if len(by_power) > 1:
+        plot_ellipticity_overlay(by_power, cfg.ellipticity_overlay_dir)
+    elif len(by_power) == 1:
+        print("Ellipticity overlay: only one power present, skipped.")
+    return by_power
+
+
+def _ellipticity_laser_angles(cfg: ExperimentConfig, power: str) -> List[float]:
+    """Laser angles to summarise for one power: CSV log first, else the planned scan."""
+    log_path = cfg.ellipticity_log_path()
+    if log_path.is_file():
+        recorded = EllipticityLog(log_path).recorded_points(power=power)
+        angles = sorted({laser for laser, _analyzer, _label in recorded})
+        if angles:
+            return angles
+    return cfg.ellipticity_laser_angles()
+
+
+def _ellipticity_points(cfg: ExperimentConfig, power: str,
+                        laser_angle_deg: float) -> List[Tuple[float, str]]:
+    """[(analyzer angle, file label)] of one sweep: CSV log first, else the plan."""
+    tag = laser_angle_tag(laser_angle_deg)
+    log_path = cfg.ellipticity_log_path()
+    if log_path.is_file():
+        recorded = [(analyzer, label)
+                    for laser, analyzer, label in EllipticityLog(log_path).recorded_points(power=power)
+                    if laser_angle_tag(laser) == tag]
+        if recorded:
+            return recorded
+    return [(float(analyzer), f"{power}_{tag}_{analyzer_angle_tag(analyzer)}")
+            for analyzer in cfg.ELLIPTICITY_ANALYZER_ANGLES]
+
+
+# ----------------------------------------------------------------------------
+# The summary figures
+# ----------------------------------------------------------------------------
+
+def plot_ellipticity_vs_laser_angle(sweeps: Sequence[Dict[str, Any]], power: str,
+                                    save_dir: Path) -> None:
+    """The point of the scan: how elliptical the emission is at each pump angle."""
+    _plot_fit_quantity(sweeps, power, save_dir / "ellipticity_vs_laser_angle.png",
+                       key="ellipticity",
+                       title=f"Ellipticity of the harmonics vs laser angle — {power}",
+                       ylabel="ellipticity  $\\epsilon = \\sqrt{I_{min}/I_{max}}$",
+                       limits=(0.0, 1.05),
+                       guides=((0.0, "linear"), (1.0, "circular")))
+
+
+def plot_modulation_vs_laser_angle(sweeps: Sequence[Dict[str, Any]], power: str,
+                                   save_dir: Path) -> None:
+    """The depth of each fitted sinusoid: the number the ellipticity is derived from."""
+    _plot_fit_quantity(sweeps, power, save_dir / "modulation_vs_laser_angle.png",
+                       key="modulation",
+                       title=f"Modulation of the analyzer sweep vs laser angle — {power}",
+                       ylabel="modulation  $m = A / I_0$",
+                       limits=(0.0, 1.05),
+                       guides=((1.0, "linear"), (0.0, "circular")))
+
+
+def _plot_fit_quantity(sweeps: Sequence[Dict[str, Any]], power: str, path: Path, key: str,
+                       title: str, ylabel: str, limits: Tuple[float, float],
+                       guides: Sequence[Tuple[float, str]] = ()) -> None:
+    """One fitted quantity per harmonic against the laser angle: linear, then polar."""
+    harmonics = sorted({harmonic for sweep in sweeps for harmonic in sweep["fits"]})
+    if not harmonics:
+        return
+
+    fig = plt.figure(figsize=(11.0, 4.8), dpi=300)
+    grid = fig.add_gridspec(1, 2, width_ratios=(1.35, 1.0))
+    linear_ax = fig.add_subplot(grid[0, 0])
+    polar_ax = fig.add_subplot(grid[0, 1], projection="polar")
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+
+    colors = cm.tab10(np.linspace(0, 1, 10))
+    for index, harmonic in enumerate(harmonics):
+        angles, values, errors = _fit_series(sweeps, harmonic, key)
+        if not len(angles):
+            continue
+        color = colors[index % len(colors)]
+        linear_ax.errorbar(angles, values, yerr=errors, color=color, marker="o",
+                           markersize=4, linewidth=1.5, capsize=2.5, label=harmonic)
+        polar_angles, polar_values = _circle_arrays(angles, values)
+        polar_ax.plot(np.deg2rad(polar_angles), polar_values, color=color, marker="o",
+                      markersize=3.5, linewidth=1.5, label=harmonic)
+
+    for level, note in guides:
+        linear_ax.axhline(level, color="0.6", linestyle=":", linewidth=1.0)
+        linear_ax.annotate(note, (1.0, level), xycoords=("axes fraction", "data"),
+                           textcoords="offset points", xytext=(-3, 3), ha="right",
+                           fontsize=7, color="0.35")
+
+    linear_ax.set_xlabel("laser angle (deg)", fontsize=9)
+    linear_ax.set_ylabel(ylabel, fontsize=9)
+    linear_ax.set_ylim(*limits)
+    linear_ax.grid(True, alpha=0.35)
+    linear_ax.tick_params(labelsize=8)
+    linear_ax.legend(fontsize=8, loc="best", framealpha=0.85)
+
+    polar_ax.set_rlim(*limits)
+    _polar_style(polar_ax, "same, on the pump's circle",
+                 sweeps[0]["series"].get("clockwise", True))
+
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  {path.name}")
+
+
+def plot_sinusoid_fits(sweeps: Sequence[Dict[str, Any]], harmonic: str, power: str,
+                       save_dir: Path) -> None:
+    """Every analyzer sweep of one harmonic and its fit, side by side.
+
+    The figure the ellipticity has to be read against: a curve grazing zero is linear,
+    a flat one is circular, and a fit missing its points is a number not to trust.
+    """
+    usable = [sweep for sweep in sweeps if harmonic in sweep["fits"]]
+    if not usable:
+        return
+
+    cols = min(4, len(usable))
+    rows = int(np.ceil(len(usable) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.0 * cols, 3.2 * rows), dpi=300,
+                             squeeze=False)
+    fig.suptitle(f"{harmonic}: analyzer sweep and its sinusoidal fit — {power}",
+                 fontsize=13, fontweight="bold")
+
+    for index, sweep in enumerate(usable):
+        ax = axes[index // cols][index % cols]
+        series, fit = sweep["series"], sweep["fits"][harmonic]
+        angles = series["angles"]
+        entry = series["harmonics"][harmonic]
+        ax.errorbar(angles, entry["mean"], yerr=entry["std"], color="tab:blue",
+                    marker="o", markersize=4, linestyle="none", capsize=2.5,
+                    label="measured")
+        _draw_sinusoid(ax, fit, angles)
+        ax.set_title(f"laser angle {sweep['laser_angle_deg']:g}°", fontsize=10,
+                     fontweight="bold")
+        ax.set_xlabel("analyzer angle (deg)", fontsize=8)
+        ax.set_ylabel("counts/s", fontsize=8)
+        ax.set_ylim(0.0, None)
+        ax.grid(True, alpha=0.35)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7, loc="best", framealpha=0.85)
+
+    for empty in range(len(usable), rows * cols):
+        axes[empty // cols][empty % cols].set_visible(False)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    path = Path(save_dir) / f"sinusoid_fits_{harmonic}.png"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  {path.name}")
+
+
+def plot_ellipticity_overlay(by_power: Dict[str, Dict[str, Any]], save_dir: Path) -> None:
+    """Ellipticity and modulation versus laser angle, one colour per power."""
+    if len(by_power) < 2:
+        return
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    colors = _power_colors(list(by_power))
+    markers = ("o", "s", "^", "D", "v")
+
+    for key, ylabel, name in (
+            ("ellipticity", "ellipticity  $\\epsilon = \\sqrt{I_{min}/I_{max}}$",
+             "ellipticity_vs_laser_angle.png"),
+            ("modulation", "modulation  $m = A / I_0$", "modulation_vs_laser_angle.png")):
+        harmonics = sorted({harmonic for campaign in by_power.values()
+                            for sweep in campaign["sweeps"] for harmonic in sweep["fits"]})
+        fig, ax = plt.subplots(figsize=(7.6, 5.0), dpi=300)
+        fig.suptitle(f"{key.capitalize()} vs laser angle — {', '.join(by_power)}",
+                     fontsize=13, fontweight="bold")
+        for power, campaign in by_power.items():
+            for index, harmonic in enumerate(harmonics):
+                angles, values, errors = _fit_series(campaign["sweeps"], harmonic, key)
+                if not len(angles):
+                    continue
+                ax.errorbar(angles, values, yerr=errors, color=colors[power],
+                            marker=markers[index % len(markers)], markersize=4,
+                            linewidth=1.4, capsize=2.5, label=f"{power} {harmonic}")
+        ax.set_xlabel("laser angle (deg)", fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(True, alpha=0.35)
+        ax.tick_params(labelsize=8)
+        ax.legend(fontsize=8, ncol=2, loc="best", framealpha=0.85)
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        fig.savefig(save_dir / name, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  {name}")
+
+    print(f"Ellipticity overlay ({len(by_power)} powers) -> {save_dir}")
+
+
+def _fit_series(sweeps: Sequence[Dict[str, Any]], harmonic: str,
+                key: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(laser angles, fitted quantity, its std) of one harmonic, in angular order."""
+    rows = [(sweep["laser_angle_deg"], sweep["fits"][harmonic][key],
+             sweep["fits"][harmonic].get(f"{key}_std", float("nan")))
+            for sweep in sweeps if harmonic in sweep["fits"]]
+    rows.sort()
+    angles = np.array([row[0] for row in rows], dtype=float)
+    values = np.array([row[1] for row in rows], dtype=float)
+    errors = np.array([row[2] for row in rows], dtype=float)
+    # errorbar refuses NaN error bars, and a fit of four points can legitimately have no
+    # usable covariance; drawing those points without a bar is better than dropping them.
+    return angles, values, np.nan_to_num(errors, nan=0.0)
+
+
+# ----------------------------------------------------------------------------
+# The numbers behind the ellipticity figures
+# ----------------------------------------------------------------------------
+
+SINUSOID_CSV_COLUMNS = [
+    "power_label", "laser_angle_deg", "kind", "target", "n_points", "period_deg",
+    "offset", "amplitude", "phase_deg", "modulation", "modulation_std", "ellipticity",
+    "ellipticity_std", "attenuation", "r_squared", "rmse",
+]
+
+ELLIPTICITY_CSV_COLUMNS = [
+    "power_label", "laser_angle_deg", "harmonic", "ellipticity", "ellipticity_std",
+    "modulation", "modulation_std", "attenuation", "mean_intensity", "r_squared",
+    "n_analyzer_angles",
+]
+
+
+def _fit_rows(power: str, laser_angle_deg: float,
+              fits: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One row per fitted target of one sweep: the harmonic totals, then the channels."""
+    rows: List[Dict[str, Any]] = []
+    for kind, entries in (("harmonic", fits["harmonics"]), ("channel", fits["channels"])):
+        for target, fit in sorted(entries.items()):
+            rows.append({
+                "power_label": power,
+                "laser_angle_deg": f"{laser_angle_deg:g}",
+                "kind": kind,
+                "target": target,
+                **{key: _number(fit[key]) for key in
+                   ("n_points", "period_deg", "offset", "amplitude", "phase_deg",
+                    "modulation", "modulation_std", "ellipticity", "ellipticity_std",
+                    "attenuation", "r_squared", "rmse")},
+            })
+    return rows
+
+
+def write_sinusoid_csv(rows: Sequence[Dict[str, Any]], path: Path) -> Optional[Path]:
+    """Every fitted sinusoid: what the modulation and the ellipticity were read from."""
+    return _write_csv(rows, path, SINUSOID_CSV_COLUMNS)
+
+
+def write_ellipticity_csv(sweeps: Sequence[Dict[str, Any]], power: str,
+                          path: Path) -> Optional[Path]:
+    """The one table the scan is for: ellipticity per harmonic, per laser angle."""
+    rows = []
+    for sweep in sweeps:
+        for harmonic, fit in sorted(sweep["fits"].items()):
+            rows.append({
+                "power_label": power,
+                "laser_angle_deg": f"{sweep['laser_angle_deg']:g}",
+                "harmonic": harmonic,
+                **{key: _number(fit[key]) for key in
+                   ("ellipticity", "ellipticity_std", "modulation", "modulation_std",
+                    "attenuation", "mean_intensity", "r_squared")},
+                "n_analyzer_angles": fit["n_points"],
+            })
+    return _write_csv(rows, path, ELLIPTICITY_CSV_COLUMNS)
+
+
+def _write_csv(rows: Sequence[Dict[str, Any]], path: Path,
+               columns: Sequence[str]) -> Optional[Path]:
+    if not rows:
+        return None
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(columns))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  {path.name}")
+    return path
+
+
+def _number(value: Any) -> str:
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return "" if value is None or not np.isfinite(value) else f"{float(value):.6g}"
 
 
 if __name__ == "__main__":
