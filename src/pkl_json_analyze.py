@@ -6,8 +6,8 @@ Four families of output, all reading the same `.pkl`/`.json` files:
   statistics, and the power sweep summary when several powers are analysed.
 * `plot_stability(snapshots, cfg)` - g2(0) and R against time, from the snapshots a
   live run recorded while it was measuring.
-* `plot_polarization_summary(cfg)` - the three polar summaries of one power:
-  intensity per channel, g²(0) per pair, harmonics (intensity + auto-g²).
+* `plot_polarization_summary(cfg)` - the four polar summaries of one power: intensity
+  per harmonic, g²(0) per pair, R per cross pair, harmonics (intensity + auto-g²).
 * `plot_polarization_campaign(cfg)` - the same for every power in the folder, then
   the multi-power butterfly overlay.
 
@@ -31,6 +31,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.cm as cm  # noqa: E402
+from scipy.interpolate import CubicSpline
 from scipy.signal import find_peaks
 import numpy as np
 from collections import defaultdict
@@ -51,6 +52,9 @@ script_path = Path(__file__).resolve().parent.parent
 Pair = Tuple[int, int]           # a channel pair, as the stability snapshots key them
 POLARIZATION_SUMMARY_CSV = "polarization_summary.csv"
 BAND_ALPHA = 0.25                # opacity of the chunk-spread band on the polar plots
+ARM_COLORS = ("tab:orange", "tab:brown")   # the arms drawn beside a harmonic total
+SMOOTH_HARMONICS = ("H4",)       # harmonics drawn as a curve interpolated through the samples
+SMOOTH_SAMPLES_PER_STEP = 16     # density of that curve, per measured angle step
 
 
 
@@ -278,16 +282,109 @@ def get_files(data_dir, pattern="*"):
 
     return merged_files, chunk_files
 
+def _parse_pair_string(pair_str):
+    ch1_str, ch2_str = pair_str.strip("()").split(",")
+    return int(ch1_str), int(ch2_str)
+
+def _normalize_legacy_payload(raw_data, modes):
+    file_correlations, file_countrates, file_total_counts = {}, {}, {}
+
+    raw_corr = raw_data.get("Correlation", {})
+    for pair_str, data_lists in raw_corr.items():
+        ch1, ch2 = _parse_pair_string(pair_str)
+        if ch1 > ch2:
+            continue
+        phys_pair = (modes.get(ch1, f"Ch{ch1}"), modes.get(ch2, f"Ch{ch2}"))
+
+        # Delays are stored in ps and used in ns everywhere downstream.
+        bins = np.array(data_lists[0]) / 1000 if len(data_lists) > 0 else np.array([])
+        coherences = data_lists[1] if len(data_lists) > 1 else []
+        file_correlations[phys_pair] = {"delay_bins": bins, "coherences": coherences}
+
+    raw_counts = raw_data.get("Countrate", {})
+    for ch_str, values in raw_counts.items():
+        ch_num = int(ch_str)
+        phys_name = modes.get(ch_num, f"Ch{ch_num}")
+        if isinstance(values, list) and len(values) >= 2:
+            file_countrates[phys_name] = values[0]
+            file_total_counts[phys_name] = values[1]
+
+    return file_correlations, file_countrates, file_total_counts
+
+def _normalize_nested_payload(raw_data, modes):
+    file_correlations, file_countrates, file_total_counts = {}, {}, {}
+    payload = raw_data.get("data", {})
+
+    raw_corr = (
+        payload.get("correlations_physical")
+        or payload.get("correlations_virtual")
+        or {}
+    )
+    for pair_str, corr_data in raw_corr.items():
+        ch1, ch2 = _parse_pair_string(pair_str)
+        if ch1 > ch2:
+            continue
+        phys_pair = (modes.get(ch1, f"Ch{ch1}"), modes.get(ch2, f"Ch{ch2}"))
+
+        bins_ps = corr_data.get("time_bins", [])
+        coherences = corr_data.get("counts", [])
+        file_correlations[phys_pair] = {
+            "delay_bins": np.array(bins_ps) / 1000,
+            "coherences": coherences,
+        }
+
+    raw_rates = (
+        payload.get("countrates_physical")
+        or payload.get("countrates_virtual")
+        or {}
+    )
+    raw_counts = (
+        payload.get("counts_physical")
+        or payload.get("counts_virtual")
+        or {}
+    )
+    for ch_str, rate in raw_rates.items():
+        ch_num = int(ch_str)
+        phys_name = modes.get(ch_num, f"Ch{ch_num}")
+        file_countrates[phys_name] = rate
+        if ch_str in raw_counts:
+            file_total_counts[phys_name] = raw_counts[ch_str]
+
+    return file_correlations, file_countrates, file_total_counts
+
+def _normalize_payload(raw_data, modes):
+    if "Correlation" in raw_data or "Countrate" in raw_data:
+        return _normalize_legacy_payload(raw_data, modes)
+    if isinstance(raw_data.get("data"), dict):
+        return _normalize_nested_payload(raw_data, modes)
+    raise ValueError(
+        "Unsupported analyzer payload format. Expected legacy Correlation/Countrate "
+        "keys or nested data/correlations_* keys."
+    )
+
+def _safe_nanmean(values):
+    arr = np.asarray(values, dtype=float)
+    return np.nan if arr.size == 0 or np.isnan(arr).all() else np.nanmean(arr)
+
+def _safe_nanstd(values):
+    arr = np.asarray(values, dtype=float)
+    return np.nan if arr.size == 0 or np.isnan(arr).all() else np.nanstd(arr)
+
+def _clean_chunk_name(filename, power_level):
+    chunk_match = re.search(rf'{re.escape(power_level)}_num\d+_chunk(\d+)', filename)
+    if chunk_match:
+        return f"chunk_{chunk_match.group(1)}"
+
+    legacy_match = re.search(rf'{re.escape(power_level)}_num(\d+)', filename)
+    if legacy_match:
+        return f"chunk_{legacy_match.group(1)}"
+
+    return Path(filename).stem
+
 def get_data(target_files, modes, power_level):
     all_data = {}
     for file_path in target_files:
-        original_filename = file_path.name
-        match = re.search(rf'({power_level}_num\d+)', original_filename)
-        if match:
-            chunk_number = re.search(r'num(\d+)', match.group(1)).group(1)
-            clean_filename = "chunk_" + chunk_number
-        else:
-            clean_filename = file_path.stem 
+        clean_filename = _clean_chunk_name(file_path.name, power_level)
             
         if file_path.suffix == ".json":
             with open(file_path, "r", encoding="utf-8") as f: raw_data = json.load(f)
@@ -296,27 +393,7 @@ def get_data(target_files, modes, power_level):
         else:
             continue
 
-        file_correlations, file_countrates, file_total_counts = {}, {}, {}
-
-        raw_corr = raw_data.get("Correlation", {})
-        for pair_str, data_lists in raw_corr.items():
-            ch1_str, ch2_str = pair_str.strip("()").split(",")
-            ch1, ch2 = int(ch1_str), int(ch2_str)
-            if ch1 > ch2: continue
-            phys_pair = (modes.get(ch1, f"Ch{ch1}"), modes.get(ch2, f"Ch{ch2}"))
-            
-            # Delays are stored in ps and used in ns everywhere downstream.
-            bins = np.array(data_lists[0]) / 1000 if len(data_lists) > 0 else np.array([])
-            coherences = data_lists[1] if len(data_lists) > 1 else []
-            file_correlations[phys_pair] = {"delay_bins": bins, "coherences": coherences}
-
-        raw_counts = raw_data.get("Countrate", {})
-        for ch_str, values in raw_counts.items():
-            ch_num = int(ch_str)
-            phys_name = modes.get(ch_num, f"Ch{ch_num}")
-            if isinstance(values, list) and len(values) >= 2:
-                file_countrates[phys_name] = values[0]
-                file_total_counts[phys_name] = values[1]
+        file_correlations, file_countrates, file_total_counts = _normalize_payload(raw_data, modes)
 
         all_data[clean_filename] = {
             "correlations": file_correlations,
@@ -554,6 +631,7 @@ def _plot_single_spectro(ax, pair, data, integration_window):
             fontsize=8, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     ax.set_title(str(pair), fontsize=10, fontweight='bold' if not is_cross_harmonic(pair) else 'normal')
     ax.grid(True, alpha=0.3)
+    ax.set_xlim(-750, 750)
 
 def plot_window_sweep(data_dict, results_dir, power_level, windows):
     sweep_results = {}
@@ -678,14 +756,14 @@ def plot_power_summary(data_dict, results_dir, power_level, windows):
     plot_data = {}
     for p in all_pairs:
         plot_data[p] = {
-            'g2_int_m': np.array([np.nanmean(aggregated[p]["g2_int"][w]) for w in windows]),
-            'g2_int_s': np.array([np.nanstd(aggregated[p]["g2_int"][w]) for w in windows]),
-            'g2_counts_m': np.array([np.nanmean(aggregated[p]["g2_counts"][w]) for w in windows]),
-            'g2_counts_s': np.array([np.nanstd(aggregated[p]["g2_counts"][w]) for w in windows]),
-            'R_int_m': np.array([np.nanmean(aggregated[p]["R_int"][w]) for w in windows]),
-            'R_int_s': np.array([np.nanstd(aggregated[p]["R_int"][w]) for w in windows]),
-            'R_counts_m': np.array([np.nanmean(aggregated[p]["R_counts"][w]) for w in windows]),
-            'R_counts_s': np.array([np.nanstd(aggregated[p]["R_counts"][w]) for w in windows]),
+            'g2_int_m': np.array([_safe_nanmean(aggregated[p]["g2_int"][w]) for w in windows]),
+            'g2_int_s': np.array([_safe_nanstd(aggregated[p]["g2_int"][w]) for w in windows]),
+            'g2_counts_m': np.array([_safe_nanmean(aggregated[p]["g2_counts"][w]) for w in windows]),
+            'g2_counts_s': np.array([_safe_nanstd(aggregated[p]["g2_counts"][w]) for w in windows]),
+            'R_int_m': np.array([_safe_nanmean(aggregated[p]["R_int"][w]) for w in windows]),
+            'R_int_s': np.array([_safe_nanstd(aggregated[p]["R_int"][w]) for w in windows]),
+            'R_counts_m': np.array([_safe_nanmean(aggregated[p]["R_counts"][w]) for w in windows]),
+            'R_counts_s': np.array([_safe_nanstd(aggregated[p]["R_counts"][w]) for w in windows]),
         }
 
     # --- 1. GRID: Averaged g2 vs Window ---
@@ -748,7 +826,7 @@ def _plot_overlap_summary_errors(path, x_arr, pairs, p_colors, plot_data, m_type
     plt.close(fig)
 
 def aggregate_power_data(data_dict, global_data, power_level):
-    match = re.search(r'\d+', power_level)
+    match = re.search(r'\d+(?:\.\d+)?', power_level)
     power_val = float(match.group()) if match else 0.0
     global_data["powers"].append(power_val)
     
@@ -764,14 +842,14 @@ def aggregate_power_data(data_dict, global_data, power_level):
         r_i = [data.get("R_integrated", {}).get(pair, np.nan) for data in data_dict.values()]
         r_c = [data.get("R_counts", {}).get(pair, np.nan) for data in data_dict.values()]
         
-        global_data["pairs"][pair]["g2_int_m"].append(np.nanmean(g2_i))
-        global_data["pairs"][pair]["g2_int_s"].append(np.nanstd(g2_i))
-        global_data["pairs"][pair]["g2_counts_m"].append(np.nanmean(g2_c))
-        global_data["pairs"][pair]["g2_counts_s"].append(np.nanstd(g2_c))
-        global_data["pairs"][pair]["R_int_m"].append(np.nanmean(r_i))
-        global_data["pairs"][pair]["R_int_s"].append(np.nanstd(r_i))
-        global_data["pairs"][pair]["R_counts_m"].append(np.nanmean(r_c))
-        global_data["pairs"][pair]["R_counts_s"].append(np.nanstd(r_c))
+        global_data["pairs"][pair]["g2_int_m"].append(_safe_nanmean(g2_i))
+        global_data["pairs"][pair]["g2_int_s"].append(_safe_nanstd(g2_i))
+        global_data["pairs"][pair]["g2_counts_m"].append(_safe_nanmean(g2_c))
+        global_data["pairs"][pair]["g2_counts_s"].append(_safe_nanstd(g2_c))
+        global_data["pairs"][pair]["R_int_m"].append(_safe_nanmean(r_i))
+        global_data["pairs"][pair]["R_int_s"].append(_safe_nanstd(r_i))
+        global_data["pairs"][pair]["R_counts_m"].append(_safe_nanmean(r_c))
+        global_data["pairs"][pair]["R_counts_s"].append(_safe_nanstd(r_c))
     return global_data
 
 def plot_metrics_vs_power(global_data, results_dir):
@@ -1032,18 +1110,21 @@ def _save_stability_figure(fig, path: Path) -> None:
 # POLARIZATION SCAN: CIRCLE / BUTTERFLY SUMMARIES VERSUS ANGLE
 # ============================================================================
 #
-# Three figures per power, under results/.../polarization/{power}/summary/:
-#   1. intensity_vs_angle.png  — one polar panel per CHANNEL
-#   2. g2_vs_angle.png         — one polar panel per PAIR
-#   3. harmonics_vs_angle.png  — per HARMONIC: intensity on top, auto-g² below
+# Four figures per power, under results/.../polarization/{power}/summary/:
+#   1. intensity_vs_angle.png  — per HARMONIC (total + its two arms): polar on top,
+#                                  the same curves on linear axes below
+#   2. g2_vs_angle.png         — one row per harmonic: its auto pair, then a whole
+#                                  cross family (33 | 34…, 44 | 35…, 55 | 45…)
+#   3. R_vs_angle.png          — one row per cross family (34…, 35…, 45…)
+#   4. harmonics_vs_angle.png  — per HARMONIC: intensity on top, auto-g² below
 #                                  (2×N grid → 4 panels for two harmonics, 6 for three)
 #
-# When several powers share a DATE folder, the same three layouts are redrawn under
+# When several powers share a DATE folder, the same four layouts are redrawn under
 # results/.../polarization/overlay/ with every power as a coloured curve on each panel.
 
 
 def plot_polarization_summary(cfg: ExperimentConfig, results_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Write the three polar summaries for one power. Returns the series used."""
+    """Write the four polar summaries for one power. Returns the series used."""
     power = cfg.POLARIZATION_BASE_POWER or cfg.POWER_LEVEL
     points = _polarization_points(cfg, power=power)
     if not points:
@@ -1060,8 +1141,9 @@ def plot_polarization_summary(cfg: ExperimentConfig, results_dir: Optional[Path]
 
     plot_polarization_intensity(series, save_dir)
     plot_polarization_g2(series, save_dir)
+    plot_polarization_r(series, save_dir)
     plot_polarization_harmonics(series, save_dir)
-    write_polarization_csv(series, save_dir / POLARIZATION_SUMMARY_CSV)
+    # write_polarization_csv(series, save_dir / POLARIZATION_SUMMARY_CSV)
 
     print(f"Polarization summary [{power}]: {len(series['angles'])} angles -> {save_dir}")
     return series
@@ -1135,6 +1217,7 @@ def collect_polarization_series(cfg: ExperimentConfig, points: Sequence[Tuple[fl
     n_chunks: List[int] = []
     channels: Dict[str, List[Tuple[float, float]]] = {}
     g2: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
+    r_values: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
     harmonics: Dict[str, List[Tuple[float, float]]] = {}
 
     for angle, label in points:
@@ -1156,6 +1239,11 @@ def collect_polarization_series(cfg: ExperimentConfig, points: Sequence[Tuple[fl
             g2.setdefault(pair, []).append(
                 _mean_std([chunk.get("g2_integrated", {}).get(pair, np.nan) for chunk in chunks]))
 
+        # R exists for the cross pairs only: compute_R_integration skips the autos.
+        for pair in _metric_pairs(chunks, "R_integrated"):
+            r_values.setdefault(pair, []).append(
+                _mean_std([chunk.get("R_integrated", {}).get(pair, np.nan) for chunk in chunks]))
+
         # Harmonic intensity = sum of its arms, summed per chunk so the spread stays
         # a spread of the total.
         for harmonic, names in _harmonic_channels(rates).items():
@@ -1168,6 +1256,7 @@ def collect_polarization_series(cfg: ExperimentConfig, points: Sequence[Tuple[fl
         "n_chunks": np.asarray(n_chunks)[order],
         "channels": _series_arrays(channels, order),
         "pairs": _series_arrays(g2, order),
+        "R": _series_arrays(r_values, order),
         "harmonics": _series_arrays(harmonics, order),
         "power_label": power_label,
         "clockwise": cfg.POLARIZATION_P1.clockwise if cfg.POLARIZATION_P1 else True,
@@ -1184,6 +1273,7 @@ def _load_polarization_angle(cfg: ExperimentConfig, label: str) -> Dict[str, Any
         return {}
     data = get_peaks(data, cfg.FREQUENCY)
     data = compute_g2_integration(data, cfg.INTEGRATION_WINDOW)
+    data = compute_R_integration(data)
     return data
 
 
@@ -1232,51 +1322,88 @@ def _series_arrays(collected: Dict[Any, List[Tuple[float, float]]], order) -> Di
 # Polar drawing helpers
 # ----------------------------------------------------------------------------
 
-def _polar_grid(n_panels: int, title: str, max_cols: int = 4, dpi: int = 300):
-    cols = max(1, min(max_cols, n_panels))
-    rows = math.ceil(n_panels / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(4.4 * cols, 4.8 * rows), dpi=dpi,
-                             subplot_kw={"projection": "polar"})
-    axes = np.atleast_1d(np.asarray(axes)).reshape(rows, cols)
-    fig.suptitle(title, fontsize=15, fontweight="bold")
-    for index in range(n_panels, rows * cols):
-        axes.flat[index].set_visible(False)
-    return fig, axes
+def _pair_family(pair: Tuple[str, str]) -> Tuple[str, str]:
+    """('H4R', 'H3T') -> ('H3', 'H4'): the two harmonics of a pair, channel order dropped.
 
-
-def _channel_arm(name: str) -> str:
-    """"H3T" -> "T": the part of a channel label after its harmonic (e.g. the arm)."""
-    return name[len(harmonic_of(name)):] or name
-
-
-def _intensity_grid(channel_names: Sequence[str], title: str, dpi: int = 300):
-    """A polar grid with one column per harmonic and one row per arm.
-
-    The two arms of a harmonic (e.g. H3T and H3R) sit one above the other, so each
-    column reads as "this harmonic" and each row as "this arm". Returns the figure and
-    a {channel: ax} map; panels with no channel are hidden.
+    Pairs are keyed in tagger-channel order, so the higher harmonic can come first.
     """
-    names = sorted(channel_names)
-    harmonics = sorted({harmonic_of(name) for name in names})
-    arms = sorted({_channel_arm(name) for name in names})
-    cols, rows = max(1, len(harmonics)), max(1, len(arms))
+    first, second = sorted((harmonic_of(pair[0]), harmonic_of(pair[1])))
+    return first, second
 
-    fig, axes = plt.subplots(rows, cols, figsize=(4.4 * cols, 4.8 * rows), dpi=dpi,
+
+def _pair_label(pair: Tuple[str, str]) -> str:
+    """('H4R', 'H3T') -> 'H3T–H4R': a title reading in harmonic order, not channel order."""
+    first, second = sorted(pair, key=lambda name: (harmonic_of(name), name))
+    return f"{first}–{second}"
+
+
+def _pairs_by_family(pairs: Sequence[Tuple[str, str]]) -> Dict[Tuple[str, str], List[Tuple[str, str]]]:
+    grouped: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
+    for pair in pairs:
+        grouped[_pair_family(pair)].append(pair)
+    # Sorted the way the panels are titled, so a row reads H3R-H4R, H3R-H4T, H3T-H4R...
+    return {family: sorted(members, key=_pair_label) for family, members in grouped.items()}
+
+
+def _auto_then_cross_rows(pairs: Sequence[Tuple[str, str]]) -> List[List[Optional[Tuple[str, str]]]]:
+    """One row per harmonic: its auto pair in column 0, then one whole cross family.
+
+    With H3/H4/H5 that reads "33 then all 34", "44 then all 35", "55 then all 45", so
+    the left column walks the auto-correlations while each row carries a single cross
+    family. Column 0 stays reserved even when a row has no auto pair, so the families
+    keep their own rows.
+    """
+    grouped = _pairs_by_family(pairs)
+    autos = sorted(family for family in grouped if family[0] == family[1])
+    crosses = sorted(family for family in grouped if family[0] != family[1])
+
+    rows: List[List[Optional[Tuple[str, str]]]] = []
+    for index in range(max(len(autos), len(crosses))):
+        auto = grouped[autos[index]] if index < len(autos) else [None]
+        cross = grouped[crosses[index]] if index < len(crosses) else []
+        rows.append([*auto, *cross])
+    return rows
+
+
+def _cross_family_rows(pairs: Sequence[Tuple[str, str]]) -> List[List[Optional[Tuple[str, str]]]]:
+    """One row per cross family: all 34, then all 35, then all 45."""
+    grouped = _pairs_by_family(pairs)
+    return [grouped[family] for family in sorted(grouped) if family[0] != family[1]]
+
+
+def _row_grid(rows: Sequence[Sequence[Optional[Tuple[str, str]]]], title: str, dpi: int = 300):
+    """Polar axes laid out exactly as `rows` says, `None` leaving a cell empty.
+
+    Returns the figure and a {pair: ax} map.
+    """
+    n_rows = max(1, len(rows))
+    n_cols = max(1, max((len(row) for row in rows), default=1))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.4 * n_cols, 4.8 * n_rows), dpi=dpi,
                              subplot_kw={"projection": "polar"})
-    axes = np.atleast_1d(np.asarray(axes)).reshape(rows, cols)
+    axes = np.atleast_1d(np.asarray(axes)).reshape(n_rows, n_cols)
     fig.suptitle(title, fontsize=15, fontweight="bold")
 
-    ax_by_name: Dict[str, Any] = {}
-    used = set()
-    for name in names:
-        row, col = arms.index(_channel_arm(name)), harmonics.index(harmonic_of(name))
-        ax_by_name[name] = axes[row, col]
-        used.add((row, col))
-    for row in range(rows):
-        for col in range(cols):
-            if (row, col) not in used:
-                axes[row, col].set_visible(False)
-    return fig, ax_by_name
+    ax_by_pair: Dict[Tuple[str, str], Any] = {}
+    for row_index in range(n_rows):
+        row = list(rows[row_index]) if row_index < len(rows) else []
+        for col_index in range(n_cols):
+            pair = row[col_index] if col_index < len(row) else None
+            if pair is None:
+                axes[row_index, col_index].set_visible(False)
+            else:
+                ax_by_pair[pair] = axes[row_index, col_index]
+    return fig, ax_by_pair
+
+
+def _two_row_grid(n_cols: int, title: str, dpi: int = 300):
+    """A polar row on top and a Cartesian row below it, one column per harmonic."""
+    n_cols = max(1, n_cols)
+    fig = plt.figure(figsize=(4.4 * n_cols, 9.4), dpi=dpi)
+    grid = fig.add_gridspec(2, n_cols)
+    polar_axes = [fig.add_subplot(grid[0, column], projection="polar") for column in range(n_cols)]
+    linear_axes = [fig.add_subplot(grid[1, column]) for column in range(n_cols)]
+    fig.suptitle(title, fontsize=15, fontweight="bold")
+    return fig, polar_axes, linear_axes
 
 
 def _fill_polar_circle(angles: np.ndarray, *series: np.ndarray):
@@ -1315,14 +1442,75 @@ def _close_polar_circle(angles: np.ndarray, *series: np.ndarray):
     return (closed_angles, *[np.append(s, s[0]) for s in series])
 
 
+def _circle_arrays(angles: np.ndarray, *values: np.ndarray):
+    """The samples as the panels draw them: tiled over the whole turn, then closed."""
+    return _close_polar_circle(*_fill_polar_circle(angles, *values))
+
+
+def _smooth_circle(angles: np.ndarray, values: np.ndarray, floor: Optional[float] = None):
+    """A cubic curve through the samples, so a sharp minimum reads as a dip.
+
+    H4 nearly extinguishes between its lobes, and with one sample every 15 deg the
+    straight segments between points cut the minimum off at whichever sample happened
+    to sit closest to it. Interpolating (periodically when the scan covers the turn, so
+    the curve joins itself smoothly at 0 deg) puts the missing curvature back without
+    moving any measured point. Returns None when there is too little to fit.
+    """
+    angles = np.asarray(angles, dtype=float)
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    if finite.sum() < 4:
+        return None
+    angles, values = angles[finite], values[finite]
+
+    periodic = angles[-1] - angles[0] >= 359.9 and np.isclose(values[0], values[-1])
+    spline = CubicSpline(angles, values, bc_type="periodic" if periodic else "natural")
+    dense = np.linspace(angles[0], angles[-1], (len(angles) - 1) * SMOOTH_SAMPLES_PER_STEP + 1)
+    smoothed = spline(dense)
+    if floor is not None:
+        smoothed = np.clip(smoothed, floor, None)
+    return dense, smoothed
+
+
 def _polar_series(ax, angles: np.ndarray, mean: np.ndarray, std: np.ndarray,
-                  color: str, label: Optional[str] = None, alpha: float = BAND_ALPHA) -> None:
-    angles, mean, std = _fill_polar_circle(angles, mean, std)
-    angles, mean, std = _close_polar_circle(angles, mean, std)
-    theta = np.deg2rad(angles)
-    low = np.clip(mean - std, 0.0, None)
-    ax.fill_between(theta, low, mean + std, color=color, alpha=alpha, linewidth=0)
-    ax.plot(theta, mean, color=color, marker="o", markersize=3.5, linewidth=1.6, label=label)
+                  color: str, label: Optional[str] = None, alpha: float = BAND_ALPHA,
+                  smooth: bool = False, floor: Optional[float] = None,
+                  linewidth: float = 1.6, markersize: float = 3.5) -> None:
+    angles, mean, std = _circle_arrays(angles, mean, std)
+    ax.fill_between(np.deg2rad(angles), np.clip(mean - std, 0.0, None), mean + std,
+                    color=color, alpha=alpha, linewidth=0)
+    _draw_curve(ax, angles, mean, color, label, smooth, floor, linewidth, markersize,
+                to_x=np.deg2rad)
+
+
+def _linear_series(ax, angles: np.ndarray, mean: np.ndarray, std: np.ndarray,
+                   color: str, label: Optional[str] = None, alpha: float = BAND_ALPHA,
+                   smooth: bool = False, floor: Optional[float] = None,
+                   linewidth: float = 1.6, markersize: float = 3.5) -> None:
+    """The same curve on Cartesian axes: angle across, value up."""
+    angles, mean, std = _circle_arrays(angles, mean, std)
+    ax.fill_between(angles, np.clip(mean - std, 0.0, None), mean + std,
+                    color=color, alpha=alpha, linewidth=0)
+    _draw_curve(ax, angles, mean, color, label, smooth, floor, linewidth, markersize)
+
+
+def _draw_curve(ax, angles: np.ndarray, mean: np.ndarray, color: str, label: Optional[str],
+                smooth: bool, floor: Optional[float], linewidth: float, markersize: float,
+                to_x=None) -> None:
+    """Points joined by segments, or by an interpolated curve with the points on top.
+
+    `to_x` maps degrees to the axis coordinate (radians on a polar panel, degrees on a
+    linear one), so both kinds of panel share the interpolation.
+    """
+    to_x = to_x if to_x is not None else (lambda degrees: degrees)
+    curve = _smooth_circle(angles, mean, floor=floor) if smooth else None
+    if curve is None:
+        ax.plot(to_x(angles), mean, color=color, marker="o", markersize=markersize,
+                linewidth=linewidth, label=label)
+        return
+    dense_angles, dense_mean = curve
+    ax.plot(to_x(dense_angles), dense_mean, color=color, linewidth=linewidth, label=label)
+    ax.plot(to_x(angles), mean, color=color, marker="o", markersize=markersize, linestyle="none")
 
 
 def _polar_style(ax, title: str, clockwise: bool = True) -> None:
@@ -1334,17 +1522,57 @@ def _polar_style(ax, title: str, clockwise: bool = True) -> None:
     ax.tick_params(labelsize=7)
 
 
-def _unity_circle(ax, level: float = 1.0) -> None:
-    """Dashed g²=1 reference, and start the radial axis at that level.
+def _linear_style(ax, title: str, ylabel: str, angles: np.ndarray) -> None:
+    ax.set_title(title, fontsize=10, fontweight="bold", pad=8)
+    ax.set_xlabel("polarization angle (deg)", fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    first, last = float(angles[0]), float(angles[-1])
+    ax.set_xlim(first, last)
+    ax.set_xticks(np.arange(45.0 * math.ceil(first / 45.0), last + 1e-6, 45.0))
+    ax.grid(True, alpha=0.35)
+    ax.tick_params(labelsize=7)
 
-    g²(0) for these signals sits at or above 1, so anchoring the inner edge at 1
-    (rather than 0) spends the whole panel on the bunching region and reads the
-    unity circle as the axis origin. Called after the data so it fixes the lower
-    limit without the autoscale pulling it back to 0.
-    """
+
+def _unity_circle(ax, level: float = 1.0) -> None:
+    """Dashed g²=1 / R=1 reference ring. The radial limits come from `_focus_radial`."""
     theta = np.linspace(0, 2 * np.pi, 181)
     ax.plot(theta, np.full_like(theta, level), color="0.45", linestyle="--", linewidth=0.9, zorder=1)
-    ax.set_rmin(level)
+
+
+def _data_limits(curves: Sequence[np.ndarray], floor: Optional[float] = None,
+                 pad: float = 0.08) -> Optional[Tuple[float, float]]:
+    """Limits set by the means alone, ignoring how far the spread band reaches.
+
+    A few angles can carry a chunk spread of several hundred percent, and letting the
+    autoscale fit those bands squashes every curve on the panel into a dot near the
+    centre. Fitting the means keeps the measured shape readable and simply clips the
+    tall bands at the rim. `floor` (0 for an intensity, 1 for g²/R) anchors the inner
+    edge when the data stays above it, and is dropped when the data goes below.
+    """
+    finite = [np.asarray(curve, dtype=float)[np.isfinite(np.asarray(curve, dtype=float))]
+              for curve in curves]
+    values = np.concatenate(finite) if any(part.size for part in finite) else np.array([])
+    if values.size == 0:
+        return None
+
+    low, high = float(values.min()), float(values.max())
+    anchored = floor is not None and low >= floor
+    if anchored:
+        low = float(floor)
+    span = (high - low) or abs(high) or 1.0
+    return (low if anchored else low - pad * span), high + pad * span
+
+
+def _focus_radial(ax, curves: Sequence[np.ndarray], floor: Optional[float] = None) -> None:
+    limits = _data_limits(curves, floor=floor)
+    if limits:
+        ax.set_rlim(*limits)
+
+
+def _focus_vertical(ax, curves: Sequence[np.ndarray], floor: Optional[float] = None) -> None:
+    limits = _data_limits(curves, floor=floor)
+    if limits:
+        ax.set_ylim(*limits)
 
 
 def _save_polar_figure(fig, path: Path) -> None:
@@ -1370,43 +1598,88 @@ def _power_legend(fig, colors: Dict[str, Any]) -> None:
 
 
 # ----------------------------------------------------------------------------
-# The three figures (single power)
+# The four figures (single power)
 # ----------------------------------------------------------------------------
 
 def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
-    """Grid of polar plots: count rate vs angle, one column per harmonic.
+    """Per harmonic: the polar butterfly on top, the same curves on linear axes below.
 
-    The two arms of a harmonic (e.g. H3T and H3R) are stacked one above the other.
+    Each column carries the harmonic total (the sum of its arms, as in
+    harmonics_vs_angle.png) plus the arms themselves as thin curves, so a lopsided pair
+    of arms shows up without a figure of its own. The linear row is the same data read
+    the other way: it separates lobes of similar radius that the polar panel overlaps.
     """
-    channels = series["channels"]
-    if not channels:
+    harmonics = sorted(series["harmonics"])
+    if not harmonics:
         return
-    fig, ax_by_name = _intensity_grid(
-        channels, f"Intensity vs polarization angle — {series['power_label']}")
-    for name, ax in ax_by_name.items():
-        _polar_series(ax, series["angles"], channels[name]["mean"], channels[name]["std"], "tab:blue")
-        _polar_style(ax, f"{name} (counts/s)", series["clockwise"])
+
+    arms_of = {harmonic: sorted(name for name in series["channels"] if harmonic_of(name) == harmonic)
+               for harmonic in harmonics}
+    fig, polar_axes, linear_axes = _two_row_grid(
+        len(harmonics), f"Intensity vs polarization angle — {series['power_label']}")
+    circle_angles = _circle_arrays(series["angles"])[0]
+
+    for column, harmonic in enumerate(harmonics):
+        total = series["harmonics"][harmonic]
+        smooth = harmonic in SMOOTH_HARMONICS
+        for ax, draw in ((polar_axes[column], _polar_series), (linear_axes[column], _linear_series)):
+            draw(ax, series["angles"], total["mean"], total["std"], "tab:blue",
+                 label=f"{harmonic} total", smooth=smooth, floor=0.0)
+            for name, color in zip(arms_of[harmonic], ARM_COLORS):
+                arm = series["channels"][name]
+                draw(ax, series["angles"], arm["mean"], arm["std"], color, label=name,
+                     smooth=smooth, floor=0.0, alpha=0.12, linewidth=1.1, markersize=2.5)
+
+        curves = [total["mean"]] + [series["channels"][name]["mean"] for name in arms_of[harmonic]]
+        _focus_radial(polar_axes[column], curves, floor=0.0)
+        _polar_style(polar_axes[column], f"{harmonic} intensity (counts/s)", series["clockwise"])
+        _focus_vertical(linear_axes[column], curves, floor=0.0)
+        _linear_style(linear_axes[column], f"{harmonic} intensity — linear axes",
+                      "counts/s", circle_angles)
+        linear_axes[column].legend(fontsize=7, loc="best", framealpha=0.8)
+
     _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
 
 
 def plot_polarization_g2(series: Dict[str, Any], save_dir: Path) -> None:
-    """Grid of polar plots: g²(0) vs angle, one panel per pair."""
+    """g²(0) vs angle: one row per harmonic, its auto pair first, then a cross family.
+
+    Row by row that reads 33 | all 34, 44 | all 35, 55 | all 45.
+    """
     pairs = series["pairs"]
     if not pairs:
         return
-    names = sorted(pairs, key=lambda pair: (is_cross_harmonic(pair), pair))
-    fig, axes = _polar_grid(
-        len(names),
-        f"$g^{{(2)}}(0)$ vs polarization angle — {series['power_label']}",
-        max_cols=min(4, len(names)),
-    )
-    for index, pair in enumerate(names):
-        ax = axes.flat[index]
+    fig, ax_by_pair = _row_grid(
+        _auto_then_cross_rows(pairs),
+        f"$g^{{(2)}}(0)$ vs polarization angle — {series['power_label']}")
+    for pair, ax in ax_by_pair.items():
         color = "tab:red" if is_cross_harmonic(pair) else "tab:green"
         _polar_series(ax, series["angles"], pairs[pair]["mean"], pairs[pair]["std"], color)
         _unity_circle(ax)
-        _polar_style(ax, f"{pair[0]}–{pair[1]}", series["clockwise"])
+        _focus_radial(ax, [pairs[pair]["mean"]], floor=1.0)
+        _polar_style(ax, _pair_label(pair), series["clockwise"])
     _save_polar_figure(fig, save_dir / "g2_vs_angle.png")
+
+
+def plot_polarization_r(series: Dict[str, Any], save_dir: Path) -> None:
+    """R = g²_cross² / (g²_auto g²_auto) vs angle: one row per cross family (34, 35, 45).
+
+    R is only defined for cross pairs, so there is no auto column here.
+    """
+    r_values = series.get("R") or {}
+    if not r_values:
+        return
+    fig, ax_by_pair = _row_grid(
+        _cross_family_rows(r_values),
+        f"$R = g^{{(2)}}_{{nm}}{{}}^2 / (g^{{(2)}}_{{nn}} g^{{(2)}}_{{mm}})$ vs polarization "
+        f"angle — {series['power_label']}")
+    for pair, ax in ax_by_pair.items():
+        _polar_series(ax, series["angles"], r_values[pair]["mean"], r_values[pair]["std"],
+                      "tab:purple")
+        _unity_circle(ax)
+        _focus_radial(ax, [r_values[pair]["mean"]], floor=1.0)
+        _polar_style(ax, f"R  {_pair_label(pair)}", series["clockwise"])
+    _save_polar_figure(fig, save_dir / "R_vs_angle.png")
 
 
 def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
@@ -1429,7 +1702,9 @@ def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
 
     for column, harmonic in enumerate(harmonics):
         signal = series["harmonics"][harmonic]
-        _polar_series(axes[0, column], series["angles"], signal["mean"], signal["std"], "tab:blue")
+        _polar_series(axes[0, column], series["angles"], signal["mean"], signal["std"], "tab:blue",
+                      smooth=harmonic in SMOOTH_HARMONICS, floor=0.0)
+        _focus_radial(axes[0, column], [signal["mean"]], floor=0.0)
         _polar_style(axes[0, column], f"{harmonic} intensity (counts/s)", series["clockwise"])
 
         pair = auto_pairs.get(harmonic)
@@ -1440,6 +1715,7 @@ def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
         g2 = series["pairs"][pair]
         _polar_series(ax, series["angles"], g2["mean"], g2["std"], "tab:green")
         _unity_circle(ax)
+        _focus_radial(ax, [g2["mean"]], floor=1.0)
         _polar_style(ax, f"{harmonic} $g^{{(2)}}(0)$  ({pair[0]}–{pair[1]})", series["clockwise"])
 
     _save_polar_figure(fig, save_dir / "harmonics_vs_angle.png")
@@ -1450,7 +1726,11 @@ def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
 # ----------------------------------------------------------------------------
 
 def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_dir: Path) -> None:
-    """Same three layouts, every power drawn on each panel as a coloured butterfly."""
+    """Same four layouts, every power drawn on each panel as a coloured butterfly.
+
+    The arm curves of the intensity figure are dropped here: with one colour per power
+    already on every panel, three more curves per harmonic would only be a thicket.
+    """
     if len(series_by_power) < 2:
         return
     save_dir = Path(save_dir)
@@ -1460,44 +1740,66 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
     clockwise = next(iter(series_by_power.values())).get("clockwise", True)
     title_suffix = ", ".join(powers)
 
-    # --- intensity: one column per harmonic, arms stacked ---
-    channel_names = sorted({name for series in series_by_power.values() for name in series["channels"]})
-    if channel_names:
-        fig, ax_by_name = _intensity_grid(channel_names,
-                                          f"Intensity vs polarization angle — {title_suffix}")
-        for name, ax in ax_by_name.items():
+    # --- intensity: per harmonic, polar on top and the same curves linear below ---
+    harmonics = sorted({h for series in series_by_power.values() for h in series["harmonics"]})
+    if harmonics:
+        fig, polar_axes, linear_axes = _two_row_grid(
+            len(harmonics), f"Intensity vs polarization angle — {title_suffix}")
+        for column, harmonic in enumerate(harmonics):
+            smooth = harmonic in SMOOTH_HARMONICS
+            curves = []
+            widest = None
             for power, series in series_by_power.items():
-                if name not in series["channels"]:
+                if harmonic not in series["harmonics"]:
                     continue
-                d = series["channels"][name]
-                _polar_series(ax, series["angles"], d["mean"], d["std"], colors[power],
-                              label=power, alpha=0.18)
-            _polar_style(ax, f"{name} (counts/s)", clockwise)
+                d = series["harmonics"][harmonic]
+                curves.append(d["mean"])
+                for ax, draw in ((polar_axes[column], _polar_series),
+                                 (linear_axes[column], _linear_series)):
+                    draw(ax, series["angles"], d["mean"], d["std"], colors[power],
+                         label=power, alpha=0.18, smooth=smooth, floor=0.0)
+                angles = _circle_arrays(series["angles"])[0]
+                if widest is None or angles[-1] - angles[0] > widest[-1] - widest[0]:
+                    widest = angles
+
+            _focus_radial(polar_axes[column], curves, floor=0.0)
+            _polar_style(polar_axes[column], f"{harmonic} intensity (counts/s)", clockwise)
+            _focus_vertical(linear_axes[column], curves, floor=0.0)
+            if widest is not None:
+                _linear_style(linear_axes[column], f"{harmonic} intensity — linear axes",
+                              "counts/s", widest)
         _power_legend(fig, colors)
         _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
 
-    # --- g2: one panel per pair ---
-    pair_names = sorted({pair for series in series_by_power.values() for pair in series["pairs"]},
-                        key=lambda pair: (is_cross_harmonic(pair), pair))
+    # --- g2: one row per harmonic, its auto pair then a cross family ---
+    pair_names = sorted({pair for series in series_by_power.values() for pair in series["pairs"]})
     if pair_names:
-        fig, axes = _polar_grid(len(pair_names),
-                                f"$g^{{(2)}}(0)$ vs polarization angle — {title_suffix}",
-                                max_cols=min(4, len(pair_names)))
-        for index, pair in enumerate(pair_names):
-            ax = axes.flat[index]
-            for power, series in series_by_power.items():
-                if pair not in series["pairs"]:
-                    continue
-                d = series["pairs"][pair]
-                _polar_series(ax, series["angles"], d["mean"], d["std"], colors[power],
-                              label=power, alpha=0.18)
+        fig, ax_by_pair = _row_grid(_auto_then_cross_rows(pair_names),
+                                    f"$g^{{(2)}}(0)$ vs polarization angle — {title_suffix}")
+        for pair, ax in ax_by_pair.items():
+            curves = _overlay_panel(ax, series_by_power, "pairs", pair, colors)
             _unity_circle(ax)
-            _polar_style(ax, f"{pair[0]}–{pair[1]}", clockwise)
+            _focus_radial(ax, curves, floor=1.0)
+            _polar_style(ax, _pair_label(pair), clockwise)
         _power_legend(fig, colors)
         _save_polar_figure(fig, save_dir / "g2_vs_angle.png")
 
+    # --- R: one row per cross family ---
+    r_names = sorted({pair for series in series_by_power.values() for pair in series.get("R", {})})
+    if r_names:
+        fig, ax_by_pair = _row_grid(
+            _cross_family_rows(r_names),
+            f"$R = g^{{(2)}}_{{nm}}{{}}^2 / (g^{{(2)}}_{{nn}} g^{{(2)}}_{{mm}})$ vs polarization "
+            f"angle — {title_suffix}")
+        for pair, ax in ax_by_pair.items():
+            curves = _overlay_panel(ax, series_by_power, "R", pair, colors)
+            _unity_circle(ax)
+            _focus_radial(ax, curves, floor=1.0)
+            _polar_style(ax, f"R  {pair[0]}–{pair[1]}", clockwise)
+        _power_legend(fig, colors)
+        _save_polar_figure(fig, save_dir / "R_vs_angle.png")
+
     # --- harmonics: intensity on top, auto-g2 below ---
-    harmonics = sorted({h for series in series_by_power.values() for h in series["harmonics"]})
     if harmonics:
         cols = len(harmonics)
         fig, axes = plt.subplots(2, cols, figsize=(4.4 * cols, 9.0), dpi=300,
@@ -1506,11 +1808,15 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
         fig.suptitle(f"Harmonics vs polarization angle — {title_suffix}",
                      fontsize=15, fontweight="bold")
         for column, harmonic in enumerate(harmonics):
+            curves = []
             for power, series in series_by_power.items():
                 if harmonic in series["harmonics"]:
                     d = series["harmonics"][harmonic]
+                    curves.append(d["mean"])
                     _polar_series(axes[0, column], series["angles"], d["mean"], d["std"],
-                                  colors[power], label=power, alpha=0.18)
+                                  colors[power], label=power, alpha=0.18,
+                                  smooth=harmonic in SMOOTH_HARMONICS, floor=0.0)
+            _focus_radial(axes[0, column], curves, floor=0.0)
             _polar_style(axes[0, column], f"{harmonic} intensity (counts/s)", clockwise)
 
             auto_pair = None
@@ -1525,18 +1831,28 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
             if auto_pair is None:
                 ax.set_visible(False)
                 continue
-            for power, series in series_by_power.items():
-                if auto_pair not in series["pairs"]:
-                    continue
-                d = series["pairs"][auto_pair]
-                _polar_series(ax, series["angles"], d["mean"], d["std"], colors[power],
-                              label=power, alpha=0.18)
+            curves = _overlay_panel(ax, series_by_power, "pairs", auto_pair, colors)
             _unity_circle(ax)
+            _focus_radial(ax, curves, floor=1.0)
             _polar_style(ax, f"{harmonic} $g^{{(2)}}(0)$  ({auto_pair[0]}–{auto_pair[1]})", clockwise)
         _power_legend(fig, colors)
         _save_polar_figure(fig, save_dir / "harmonics_vs_angle.png")
 
     print(f"Polarization overlay ({len(powers)} powers) -> {save_dir}")
+
+
+def _overlay_panel(ax, series_by_power: Dict[str, Dict[str, Any]], key: str,
+                   target: Any, colors: Dict[str, Any]) -> List[np.ndarray]:
+    """Draw one quantity of every power on one panel; return the means for the limits."""
+    curves = []
+    for power, series in series_by_power.items():
+        entry = series.get(key, {}).get(target)
+        if entry is None:
+            continue
+        curves.append(entry["mean"])
+        _polar_series(ax, series["angles"], entry["mean"], entry["std"], colors[power],
+                      label=power, alpha=0.18)
+    return curves
 
 
 # ----------------------------------------------------------------------------
@@ -1553,7 +1869,8 @@ def write_polarization_csv(series: Dict[str, Any], path: Path) -> Path:
         }
         for quantity, entries in (("countrate", series["channels"]),
                                   ("harmonic_countrate", series["harmonics"]),
-                                  ("g2", series["pairs"])):
+                                  ("g2", series["pairs"]),
+                                  ("R", series["R"])):
             for name, values in sorted(entries.items(), key=lambda item: str(item[0])):
                 rows.append({
                     **common,

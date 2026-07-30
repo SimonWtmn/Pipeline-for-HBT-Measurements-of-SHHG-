@@ -41,22 +41,22 @@ except ImportError:
 CONFIG = ExperimentConfig(
     # ----------------- identity -----------------
     MATERIAL="CdTe110",
-    EXPERIENCE_TYPE="Polarization_Scan",
-    DATE="30072026",
-    POWER_LEVEL="50mW",
+    EXPERIENCE_TYPE="Powerscan_NewSetup",
+    DATE="21072026",
+    POWER_LEVELS=["10.04mW", "15.5mW", "20.02mW", "24.96mW", "30mW", "35mW", "40.1mW"],
 
     # ----------------- optics / metadata -----------------
     FREQUENCY=18.66e6,
-    MODES={1: "H3T", 2: "H3R", 3: "H4T", 4: "H4R", 5: "H5T", 6: "H5R"},
+    MODES={1: "H4R", 2: "H4T", 3: "H5R", 4: "H5T", 5: "H3R", 6: "H3T"},
     P1={"present": False, "angle_deg": 0.0},
     P2={"present": False, "angle_deg": 0.0},
     P3={"present": False, "angle_deg": 0.0},
     HWP_ANGLE_DEG=0.0,
-    COVER={"present": True, "description": "between channels"},
+    COVER={"present": False, "description": "between channels"},
     FILTERS={
-        "H3": {"separation": "per-channel", "filter": "700-40"},
-        "H4": {"separation": "per-channel", "filter": "520=40"},
-        "H5": {"separation": "per-channel", "filter": "400-20"},
+        "H3": {"separation": "unknown", "filter": "unknown"},
+        "H4": {"separation": "unknown", "filter": "unknown"},
+        "H5": {"separation": "unknown", "filter": "unknown"},
     },
 
     # ----------------- Time Tagger -----------------
@@ -91,28 +91,28 @@ CONFIG = ExperimentConfig(
     POWER_SCAN_STOP_ON_ERROR=True,
 
     # ----------------- polarization scan -----------------
-    POLARIZATION_SCAN=np.arange(0.0, 180.0, 4.0),
+    POLARIZATION_SCAN=None,
     # POLARIZATION_POWER=90,                  # ignored while POLARIZATION_POWER_SCAN is set
-    POLARIZATION_POWER_SCAN=[                 # a full angle scan at each power, one run
-        {"power": "90mW", "requested_power": 90.0},
-        {"power": "70mW", "requested_power": 70.0},
-        {"power": "50mW", "requested_power": 50.0},
-        {"power": "30mW", "requested_power": 30.0},
-        {"power": "20mW", "requested_power": 20.0},
-    ],
-    POLARIZATION_CALIBRATION=None,          # None -> linear_polarization_lookup_latest.npz
-    POLARIZATION_CALIBRATION_DIR=None,      # None -> polarization_calibration/
-    POLARIZATION_STAGE_ENABLED=True,
-    POLARIZATION_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
-    POLARIZATION_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
-    POLARIZATION_SETTLE_TIME_S=0.2,
-    POLARIZATION_STAGE_DRY_RUN=False,        # rehearse first; set False to move the mounts
-    POLARIZATION_PLOT_ANGLES=False,         # summaries only; True to also analyse each angle
+    # POLARIZATION_POWER_SCAN=[                 # a full angle scan at each power, one run
+    #     {"power": "90mW", "requested_power": 90.0},
+    #     {"power": "70mW", "requested_power": 70.0},
+    #     {"power": "50mW", "requested_power": 50.0},
+    #     {"power": "30mW", "requested_power": 30.0},
+    #     {"power": "20mW", "requested_power": 20.0},
+    # ],
+    # POLARIZATION_CALIBRATION=None,          # None -> linear_polarization_lookup_latest.npz
+    # POLARIZATION_CALIBRATION_DIR=None,      # None -> polarization_calibration/
+    # POLARIZATION_STAGE_ENABLED=True,
+    # POLARIZATION_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
+    # POLARIZATION_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
+    # POLARIZATION_SETTLE_TIME_S=0.2,
+    # POLARIZATION_STAGE_DRY_RUN=False,        # rehearse first; set False to move the mounts
+    # POLARIZATION_PLOT_ANGLES=False,         # summaries only; True to also analyse each angle
 
     INTEGRATION_WINDOW=8,
     INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
-    RUN_ANALYSIS_AFTER_ACQUIRE=True,
-    ANALYZE_ONLY=False,
+    RUN_ANALYSIS_AFTER_ACQUIRE=False,
+    ANALYZE_ONLY=True,
 )
 
 
