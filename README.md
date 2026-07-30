@@ -302,10 +302,10 @@ nothing:
 
 | Figure | One row/panel per | Shows |
 | --- | --- | --- |
-| `intensity_vs_angle.png` | harmonic | count rate: polar on top, the same curves on linear axes below, with the interpolated minima marked |
+| `intensity_vs_angle.png` | harmonic | count rate on one large linear panel — the sum and both arms, interpolated minima marked and labelled — with a polar thumbnail of the same curves in its corner |
 | `g2_vs_angle.png` | harmonic | its auto pair first, then that harmonic's whole cross family |
 | `R_vs_angle.png` | cross family | R, dashed unit circle |
-| `harmonics_vs_angle.png` | harmonic | a 2×N grid: the harmonic's total signal on top, its auto-g²(0) directly below |
+| `harmonics_vs_angle.png` | harmonic | a 2×N polar grid: the harmonic's total and both its arms on top, its auto-g²(0) directly below. The full-size butterflies live here |
 
 g²(0) on these figures is the **integration** estimator only — the counts-based one is not comparable across angles while `Np` is hard-coded (§11.1).
 
@@ -342,14 +342,21 @@ The laser angle scan asks what the crystal emits; this one asks **how that emiss
 * a curve that reaches **zero** — one axis of the ellipse carries nothing — is a **linear** polarization;
 * a **flat** curve — both axes carry the same — is a **circular** one.
 
-Written with the fitted offset $I_0$ and amplitude $A$, the modulation is $m = A/I_0$, the two intensities the fit reaches are $I_{max} = I_0 + A$ and $I_{min} = I_0 - A$, and
+The curve is Malus' law in the plate angle,
 
 $$
-\text{attenuation} = \frac{I_{min}}{I_{max}} = \frac{1-m}{1+m}, \qquad
+I(\theta) = I_0 \cos^2\!\big(f\,(\theta - \theta_0)\big) + \text{floor},
+\qquad f = 2 \text{ for a HWP},
+$$
+
+and its floor **is** the smaller axis of the ellipse while its crest is the larger one. So with $I_{max} = I_0 + \text{floor}$ and $I_{min} = \text{floor}$ (clipped at zero),
+
+$$
+\text{attenuation} = \frac{I_{min}}{I_{max}}, \qquad
 \epsilon = \sqrt{\text{attenuation}}
 $$
 
-so ε = 0 is linear and ε = 1 is circular. Repeating that sweep at several pump angles is what gives **ellipticity versus laser angle**, which is the point of the scan.
+so ε = 0 is linear and ε = 1 is circular. Repeating that sweep at several pump angles is what gives **ellipticity versus laser angle**, which is the point of the scan. The same depth written as a fraction of the mean is the modulation $m = (1-\text{attenuation})/(1+\text{attenuation})$, which is what `modulation_vs_laser_angle.png` plots.
 
 ```python
 CONFIG = ExperimentConfig(
@@ -390,7 +397,7 @@ Three mounts, then: the two pump mounts of §3.6 — the pump polarization is se
 
 **How the files are named.** Each point carries both angles: `50mW_las045p0_hwp000p0`, `50mW_las045p0_hwp015p0`, … Same fixed-width rule as §3.6, and the `hwp` half is what distinguishes an ellipticity point from a laser angle scan's `50mW_las045p0` — so both scans can share a `DATE` folder without their files being confused for one another.
 
-**Per sweep**, under `results/…/ellipticity/{POWER}/las045p0/`, you get the same four vs-angle figures as a laser angle scan, drawn against **analyzer** angle, with the fitted sinusoid overlaid on the linear intensity panels and `sinusoidal_fit.csv` holding every fitted parameter (per harmonic, and per channel as a cross-check).
+**Per sweep**, under `results/…/ellipticity/{POWER}/las045p0/`, you get the same four vs-angle figures as a laser angle scan, drawn against **analyzer** angle, with the fitted curve overlaid on the intensity panels and `sinusoidal_fit.csv` holding every fitted parameter (per harmonic, and per channel as a cross-check). `intensity_vs_angle.png` is the one to read: the depth of the curve there *is* the ellipticity, so that figure is one large linear panel per harmonic — the polar butterfly of the same curves sits in the corner as a thumbnail, and full size in `harmonics_vs_angle.png`.
 
 **Per power**, under `results/…/ellipticity/{POWER}/summary/`:
 
@@ -401,7 +408,7 @@ Three mounts, then: the two pump mounts of §3.6 — the pump polarization is se
 | `sinusoid_fits_{harmonic}.png` | every analyzer sweep of that harmonic and its fit, side by side, so a bad fit is visible rather than averaged in |
 | `ellipticity_vs_laser_angle.csv` | ε, *m*, attenuation, R² and the mean intensity per (laser angle, harmonic) |
 
-The fit itself holds the period at the 90° a half-wave plate imposes, which leaves three linear parameters (offset, amplitude, phase) and makes it an ordinary least-squares solve — it cannot fail to converge on a nearly flat curve, which is exactly the interesting case. Uncertainties are the usual residual-based ones, propagated from the fit into *m* and then into ε. A sweep with fewer than four analyzer angles carrying data is skipped rather than fitted.
+**The fit** is `scipy.optimize.curve_fit` on the Malus curve above, with the starting guesses taken from the measured extremes, θ₀ folded into [0°, 180°), and ε read as $\sqrt{I_{min}/I_{max}}$ with $I_{min}$ clipped at zero. That is the lab's own scan routine, kept identical on purpose: a number quoted from this pipeline is the number that routine would have given for the same sweep. Two things are added around it. The covariance `curve_fit` already computes is propagated into the error bars of the ε and *m* figures. And if `curve_fit` refuses to converge, the sweep falls back to a projection onto the model's own frequency — a single linear solve, no iteration, so it always returns something — with the `method` column of `sinusoidal_fit.csv` recording which of the two ran. A sweep with fewer than four analyzer angles carrying data is skipped rather than fitted.
 
 Several powers work exactly as in §3.6 — `PUMP_POWER_SCAN` to record them in one command, `PUMP_POWERS` to replay them — and put ε and *m* for every power on the same axes under `results/…/ellipticity/overlay/`. As with the laser angle scan, the heavy per-point HBT trees are off unless `ELLIPTICITY_PLOT_POINTS=True`: there is one per (laser angle, analyzer angle) pair, so a 3 × 12 scan would render 36 of them.
 
@@ -628,7 +635,7 @@ it at each pump angle:
 | `ELLIPTICITY_ANALYZER_ENABLED` | `False` | actually turn that plate |
 | `ELLIPTICITY_ANALYZER_DRY_RUN` | `False` | log the moves, import nothing, move nothing |
 | `ELLIPTICITY_ANALYZER_SETTLE_TIME_S` | `0.2` | extra pause after the plate has arrived |
-| `ELLIPTICITY_FIT_PERIOD_DEG` | `90.0` | the period the sinusoid is held at; 90° for a HWP |
+| `ELLIPTICITY_FIT_PERIOD_DEG` | `90.0` | the period of the fitted Malus curve; 90° for a HWP, 180° for a polarizer |
 | `ELLIPTICITY_FIXED_POLARIZER_DEG` | `0.0` | metadata only: the fixed polarizer, 0 = vertical |
 | `ANALYZER_ANGLE_DEG` | `None` | the plate angle of **this** acquisition, set by the loop |
 | `ELLIPTICITY_PLOT_POINTS` | `False` | also draw the full HBT tree of every point |
@@ -669,9 +676,9 @@ and three specific to the ellipticity scan:
 
 | Situation | Why it is refused |
 | --- | --- |
-| fewer than four `ELLIPTICITY_ANALYZER_ANGLES` | the sinusoid has three free parameters, so three points cannot be fitted |
+| fewer than four `ELLIPTICITY_ANALYZER_ANGLES` | the Malus curve has three free parameters, so three points cannot be fitted |
 | `ELLIPTICITY_FIT_PERIOD_DEG` not positive | there would be no period to hold the fit at |
-| the analyzer disabled, or enabled with no serial number | every analyzer angle would be recorded with the plate standing still, so the sinusoid would come out flat for want of motion rather than because the emission is circular |
+| the analyzer disabled, or enabled with no serial number | every analyzer angle would be recorded with the plate standing still, so the curve would come out flat for want of motion rather than because the emission is circular |
 
 The hardware checks are skipped when `ANALYZE_ONLY=True` (reprocessing never moves
 anything) or when the matching `*_DRY_RUN` is set (an explicit "I know there is no
@@ -1111,10 +1118,12 @@ than as it was requested.
 
 ```
 results/{MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/laser_angle/
-    25mW/summary/intensity_vs_angle.png     polar on top, linear below, minima marked
+    25mW/summary/intensity_vs_angle.png     one large linear panel per harmonic, minima
+                                              marked, polar thumbnail in the corner
     25mW/summary/g2_vs_angle.png            one row per harmonic: auto pair, then cross
     25mW/summary/R_vs_angle.png             one row per cross family
-    25mW/summary/harmonics_vs_angle.png     2×N: intensity on top, auto-g² below
+    25mW/summary/harmonics_vs_angle.png     2×N: intensity (sum and both arms) on top,
+                                              auto-g² below
     25mW/summary/interpolated_minima.csv    the angle of each intensity minimum
     25mW/angles/25mW_las000p0/…             one full HBT tree per angle, only with
     25mW/angles/25mW_las015p0/…               LASER_ANGLE_PLOT_ANGLES=True
@@ -1134,8 +1143,8 @@ overlay has to be redrawn. `overlay/` appears only when at least two powers are 
 ```
 results/{MATERIAL}/{EXPERIENCE_TYPE}/{DATE}/ellipticity/
     50mW/las000p0/intensity_vs_angle.png    the same four layouts as §6.5, but against
-    50mW/las000p0/g2_vs_angle.png             ANALYZER angle, with the fitted sinusoid
-    50mW/las000p0/R_vs_angle.png              drawn on the linear intensity panels
+    50mW/las000p0/g2_vs_angle.png             ANALYZER angle, with the fitted Malus
+    50mW/las000p0/R_vs_angle.png              curve drawn on the intensity panels
     50mW/las000p0/harmonics_vs_angle.png
     50mW/las000p0/sinusoidal_fit.csv        every fitted parameter of that sweep
     50mW/las045p0/…                         one folder per laser angle
@@ -1164,10 +1173,11 @@ power_label,laser_angle_deg,harmonic,ellipticity,ellipticity_std,modulation,modu
 ```
 
 Read as: at 0° the emission is linear, at 90° it is nearly circular, and 45° sits in
-between. `sinusoidal_fit.csv` holds the same fits with the raw parameters (offset,
-amplitude, phase, RMSE) and adds one row per **channel** as well as per harmonic —
-a transmitted and a reflected arm that disagree is how a mis-set analyzer or a clipped
-beam shows up.
+between. `sinusoidal_fit.csv` holds the same fits with the raw Malus parameters (`i0`,
+`floor`, `theta_deg`, the two intensities `i_max`/`i_min` and the angles they occur at,
+the RMSE, and the `method` that produced them), and adds one row per **channel** as well
+as per harmonic — a transmitted and a reflected arm that disagree is how a mis-set
+analyzer or a clipped beam shows up.
 
 ---
 
@@ -1344,9 +1354,10 @@ All of it reuses `get_data` / `get_peaks` / `compute_g2_integration`, so a point
 polar figure is the number the per-angle tree would give for that angle, and the band
 around it is the standard deviation over that angle's chunks.
 
-**Part 4 — the ellipticity fits.** `fit_sinusoid` is the whole physics: a least-squares
-solve at the fixed period of §3.7, whose uncertainties `ellipticity_of` propagates into
-the ellipticity. `fit_angle_series` applies it to every harmonic and channel of one
+**Part 4 — the ellipticity fits.** `fit_sinusoid` is the whole physics: `curve_fit` on the
+Malus curve of §3.7, `_projection_fit` behind it as the fallback, `_crest_upwards` to keep
+the floor at the bottom where the physics puts it, and `ellipticity_of` to read ε off the
+two intensities. `fit_angle_series` applies it to every harmonic and channel of one
 sweep; `plot_ellipticity_power(cfg, power)` fits every sweep of one power, draws its four
 vs-analyzer-angle figures, then `plot_ellipticity_vs_laser_angle`,
 `plot_modulation_vs_laser_angle` and `plot_sinusoid_fits`;
@@ -1660,14 +1671,15 @@ the full `POWER_LEVELS`.
 
 ### 10.24 Every ellipticity comes out at 1 (circular)
 
-An ellipticity of 1 means the fitted sinusoid was flat, and a plate that never moved
+An ellipticity of 1 means the fitted curve was flat, and a plate that never moved
 produces exactly that. Check `analyzer_motion` in `[ellipticity_scan]`: `dry run (angles
 logged, nothing moved)` means `ELLIPTICITY_ANALYZER_DRY_RUN` was left on from a rehearsal.
 (The combination "ellipticity scan configured, `ELLIPTICITY_ANALYZER_ENABLED=False`" is
 refused outright, for this reason.) Otherwise look at
 `summary/sinusoid_fits_{harmonic}.png`: a genuine circular emission is a flat curve
 through scattered points, a plate that did not move is a flat curve through points with
-no scatter at all.
+no scatter at all. Do not read R² as the alarm here — a flat curve has no variance to
+explain, so R² collapses towards 0 for **any** near-circular sweep, honest ones included.
 
 Read the other end of the scale the same way: ε ≈ 0 with an R² near 1 is a linear
 polarization, ε ≈ 0 with a poor R² usually means the sweep is not a sinusoid of period 90°
@@ -1772,15 +1784,18 @@ figures, ideally on a replay (`ANALYZE_ONLY=True`) rather than while the beam is
 `ε = sqrt(I_min/I_max)` is the ratio of the ellipse's axes, so it says how elliptical the
 emission is but not which way it turns: a left- and a right-circular emission both come
 out at 1. Handedness is not accessible from a half-wave plate and a fixed polarizer at
-all — it needs a quarter-wave plate, i.e. a different measurement. The fitted `phase_deg`
+all — it needs a quarter-wave plate, i.e. a different measurement. The fitted `theta_deg`
 in `sinusoidal_fit.csv` does carry the **orientation** of the ellipse's major axis, which
-is the part of the polarization state this setup can still report.
+is the part of the polarization state this setup can still report — modulo the period,
+though: a HWP's transmission curve repeats every 90°, so `theta_deg` (reported in
+[0°, 180°), as the lab's routine reports it) is only determined up to ±90°, and two sweeps
+of the same orientation can be written down 90° apart. Take it mod 90° before comparing.
 
 ### 11.11 A flat sweep and a dark one look alike to the fit
 
-The fit reads the modulation as `amplitude / offset`, which is a ratio: a sweep whose
-signal is genuinely flat and one whose signal is buried in a background both give a small
-modulation, hence an ellipticity near 1. Nothing subtracts a background, and no dark
-count is recorded. `mean_intensity` in `ellipticity_vs_laser_angle.csv` is the fitted
-offset and therefore the number to check — an ellipticity near 1 at an intensity far
-below the other pump angles' is more likely a weak signal than a circular one.
+ε is a ratio of the two intensities the curve reaches: a sweep whose signal is genuinely
+flat and one whose signal is buried in a background both come out near 1. Nothing
+subtracts a background, and no dark count is recorded. `mean_intensity` in
+`ellipticity_vs_laser_angle.csv` is the mean of the fitted curve and therefore the number
+to check — an ellipticity near 1 at an intensity far below the other pump angles' is more
+likely a weak signal than a circular one.

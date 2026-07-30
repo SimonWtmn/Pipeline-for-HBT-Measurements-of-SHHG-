@@ -35,6 +35,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.cm as cm  # noqa: E402
 from scipy.interpolate import CubicSpline
+from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import numpy as np
 from collections import defaultdict
@@ -1442,15 +1443,12 @@ def _row_grid(rows: Sequence[Sequence[Optional[Tuple[str, str]]]], title: str, d
     return fig, ax_by_pair
 
 
-def _two_row_grid(n_cols: int, title: str, dpi: int = 300):
-    """A polar row on top and a Cartesian row below it, one column per harmonic."""
+def _linear_row_grid(n_cols: int, title: str, dpi: int = 300):
+    """One wide Cartesian panel per harmonic, big enough to carry a polar inset."""
     n_cols = max(1, n_cols)
-    fig = plt.figure(figsize=(4.4 * n_cols, 9.4), dpi=dpi)
-    grid = fig.add_gridspec(2, n_cols)
-    polar_axes = [fig.add_subplot(grid[0, column], projection="polar") for column in range(n_cols)]
-    linear_axes = [fig.add_subplot(grid[1, column]) for column in range(n_cols)]
+    fig, axes = plt.subplots(1, n_cols, figsize=(6.8 * n_cols, 6.0), dpi=dpi, squeeze=False)
     fig.suptitle(title, fontsize=15, fontweight="bold")
-    return fig, polar_axes, linear_axes
+    return fig, list(axes[0])
 
 
 def _fill_polar_circle(angles: np.ndarray, *series: np.ndarray):
@@ -1604,20 +1602,35 @@ def _draw_curve(ax, angles: np.ndarray, mean: np.ndarray, color: str, label: Opt
 
 
 def _draw_sinusoid(ax, fit: Dict[str, Any], angles: np.ndarray, to_x=None,
-                   color: str = "0.15") -> None:
-    """The fitted sinusoid over the drawn angle range, labelled with what it measures.
+                   color: str = "0.15", mark_extrema: bool = True) -> None:
+    """The fitted Malus curve over the drawn angle range, labelled with what it measures.
 
-    Drawn instead of the cubic spline of SMOOTH_HARMONICS: an analyzer sweep is a
-    sinusoid by construction, so the fit IS the curve, and its depth is the number the
-    ellipticity comes from.
+    Drawn instead of the cubic spline of SMOOTH_HARMONICS: an analyzer sweep is this
+    curve by construction, so the fit IS the interpolation, and its depth is the number
+    the ellipticity comes from. R² says whether that number can be trusted. The crest and
+    the floor of the fit are ringed when they fall inside the drawn window: those two
+    intensities are exactly what ε = sqrt(I_min/I_max) is read from.
     """
     to_x = to_x if to_x is not None else (lambda degrees: degrees)
     dense = np.linspace(float(angles[0]), float(angles[-1]), 361)
     values = np.clip(sinusoid(dense, fit), 0.0, None)
-    label = (f"fit: m={fit['modulation']:.3f}, "
-             f"$\\epsilon$={fit['ellipticity']:.3f}")
+    label = (f"fit: $\\epsilon$={fit['ellipticity']:.3f}, m={fit['modulation']:.3f}, "
+             f"$R^2$={fit['r_squared']:.3f}")
     ax.plot(to_x(dense), values, color=color, linestyle="--", linewidth=1.4,
             label=label, zorder=4)
+    if not mark_extrema:
+        return
+    first, last = float(angles[0]), float(angles[-1])
+    for key, marker, mark_color, mark_label in (
+            ("angle_at_max_deg", "^", "tab:green", r"$I_{\mathrm{max}}$"),
+            ("angle_at_min_deg", "v", "tab:red", r"$I_{\mathrm{min}}$")):
+        angle = fit.get(key)
+        if angle is None or not (first <= angle <= last):
+            continue
+        intensity = fit["i_max"] if key.endswith("max_deg") else fit["i_min"]
+        ax.plot(to_x(np.asarray([angle])), [intensity], linestyle="none",
+                marker=marker, markersize=8, color=mark_color, zorder=5,
+                label=f"{mark_label} at {angle:.1f}°")
 
 
 def _mark_minima(ax, minima: Sequence[Tuple[float, float]], color: str = "0.2",
@@ -1651,14 +1664,39 @@ def _polar_style(ax, title: str, clockwise: bool = True) -> None:
 
 def _linear_style(ax, title: str, ylabel: str, angles: np.ndarray,
                   angle_name: str = "angle") -> None:
-    ax.set_title(title, fontsize=10, fontweight="bold", pad=8)
-    ax.set_xlabel(f"{angle_name} (deg)", fontsize=8)
-    ax.set_ylabel(ylabel, fontsize=8)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=8)
+    ax.set_xlabel(f"{angle_name} (deg)", fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
     first, last = float(angles[0]), float(angles[-1])
     ax.set_xlim(first, last)
     ax.set_xticks(np.arange(45.0 * math.ceil(first / 45.0), last + 1e-6, 45.0))
     ax.grid(True, alpha=0.35)
-    ax.tick_params(labelsize=7)
+    ax.tick_params(labelsize=9)
+
+
+POLAR_INSET_RECT = (0.635, 0.615, 0.355, 0.375)   # axes fraction: the panel's top right
+
+
+def _polar_inset(ax, clockwise: bool = True):
+    """A thumbnail of the same curves on the circle, inside a linear panel.
+
+    The polar butterfly is the shape everyone reads first, but what a number comes from
+    is the depth of the linear curve, so on the intensity figure the circle keeps its
+    place as a thumbnail and the linear panel gets the room. The full-size polar version
+    of the same curves is in harmonics_vs_angle.png.
+
+    Fits in the corner because `_focus_vertical(..., headroom=...)` left it empty.
+    """
+    inset = ax.inset_axes(POLAR_INSET_RECT, projection="polar")
+    inset.set_theta_zero_location("N")
+    inset.set_theta_direction(-1 if clockwise else 1)
+    inset.set_xticks(np.deg2rad([0.0, 90.0, 180.0, 270.0]))
+    inset.set_xticklabels(["0°", "90°", "180°", "270°"])
+    inset.set_yticklabels([])
+    inset.grid(True, alpha=0.3, linewidth=0.6)
+    inset.tick_params(labelsize=5.5, pad=-3)
+    inset.patch.set_alpha(0.8)
+    return inset
 
 
 def _unity_circle(ax, level: float = 1.0) -> None:
@@ -1668,7 +1706,7 @@ def _unity_circle(ax, level: float = 1.0) -> None:
 
 
 def _data_limits(curves: Sequence[np.ndarray], floor: Optional[float] = None,
-                 pad: float = 0.08) -> Optional[Tuple[float, float]]:
+                 pad: float = 0.08, headroom: float = 0.0) -> Optional[Tuple[float, float]]:
     """Limits set by the means alone, ignoring how far the spread band reaches.
 
     A few angles can carry a chunk spread of several hundred percent, and letting the
@@ -1676,6 +1714,9 @@ def _data_limits(curves: Sequence[np.ndarray], floor: Optional[float] = None,
     centre. Fitting the means keeps the measured shape readable and simply clips the
     tall bands at the rim. `floor` (0 for an intensity, 1 for g²/R) anchors the inner
     edge when the data stays above it, and is dropped when the data goes below.
+
+    `headroom` adds empty space above the data, in units of its own span, for a panel
+    that has to hold a legend and a polar inset over the curves.
     """
     finite = [np.asarray(curve, dtype=float)[np.isfinite(np.asarray(curve, dtype=float))]
               for curve in curves]
@@ -1688,7 +1729,7 @@ def _data_limits(curves: Sequence[np.ndarray], floor: Optional[float] = None,
     if anchored:
         low = float(floor)
     span = (high - low) or abs(high) or 1.0
-    return (low if anchored else low - pad * span), high + pad * span
+    return (low if anchored else low - pad * span), high + (pad + headroom) * span
 
 
 def _focus_radial(ax, curves: Sequence[np.ndarray], floor: Optional[float] = None) -> None:
@@ -1697,13 +1738,15 @@ def _focus_radial(ax, curves: Sequence[np.ndarray], floor: Optional[float] = Non
         ax.set_rlim(*limits)
 
 
-def _focus_vertical(ax, curves: Sequence[np.ndarray], floor: Optional[float] = None) -> None:
-    limits = _data_limits(curves, floor=floor)
+def _focus_vertical(ax, curves: Sequence[np.ndarray], floor: Optional[float] = None,
+                    headroom: float = 0.0) -> None:
+    limits = _data_limits(curves, floor=floor, headroom=headroom)
     if limits:
         ax.set_ylim(*limits)
 
 
-def _save_polar_figure(fig, path: Path) -> None:
+def _save_grid_figure(fig, path: Path) -> None:
+    """Lay a figure of panels out, write it, and name it on the console."""
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.subplots_adjust(hspace=0.45, wspace=0.35)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1730,20 +1773,23 @@ def _power_legend(fig, colors: Dict[str, Any]) -> None:
 # ----------------------------------------------------------------------------
 
 def plot_angle_intensity(series: Dict[str, Any], save_dir: Path) -> None:
-    """Per harmonic: the polar butterfly on top, the same curves on linear axes below.
+    """Per harmonic, one large linear panel: intensity against the angle, plus a thumbnail.
 
-    Each column carries the harmonic total (the sum of its arms, as in
-    harmonics_vs_angle.png) plus the arms themselves as thin curves, so a lopsided pair
-    of arms shows up without a figure of its own. The linear row is the same data read
-    the other way: it separates lobes of similar radius that the polar panel overlaps.
+    The linear reading is the one that carries a number - the depth of an analyzer sweep
+    IS the ellipticity, and it separates lobes of similar radius that a polar panel
+    overlaps - so it gets the whole panel. The polar butterfly of the same curves sits in
+    the corner as an inset, full size in harmonics_vs_angle.png.
+
+    Each panel carries the harmonic total (the sum of its arms) plus the arms themselves
+    as thin curves, so a lopsided pair of arms shows up without a figure of its own.
 
     The interpolation of SMOOTH_HARMONICS is applied to the sum only, and its minima are
-    ringed on both rows, labelled with their angle on the linear one, and written to
-    interpolated_minima.csv beside the figure.
+    ringed on both the panel and its inset, labelled with their angle on the panel, and
+    written to interpolated_minima.csv beside the figure.
 
-    An ellipticity sweep also carries `series["fits"]`: the sinusoid fitted to each
-    harmonic total is then drawn on the linear panel, with the modulation and the
-    ellipticity it gives, since that curve is the measurement.
+    An ellipticity sweep also carries `series["fits"]`: the fitted curve is then drawn on
+    the panel, with the modulation and the ellipticity it gives, since that curve is the
+    measurement.
     """
     harmonics = sorted(series["harmonics"])
     if not harmonics:
@@ -1753,43 +1799,42 @@ def plot_angle_intensity(series: Dict[str, Any], save_dir: Path) -> None:
     fits = series.get("fits") or {}
     arms_of = {harmonic: sorted(name for name in series["channels"] if harmonic_of(name) == harmonic)
                for harmonic in harmonics}
-    fig, polar_axes, linear_axes = _two_row_grid(
+    fig, axes = _linear_row_grid(
         len(harmonics), f"Intensity vs {angle_name} — {series.get('title', series['power_label'])}")
     circle_angles = _circle_arrays(series["angles"])[0]
     minima_rows: List[Dict[str, Any]] = []
 
     for column, harmonic in enumerate(harmonics):
+        ax = axes[column]
+        inset = _polar_inset(ax, series["clockwise"])
         total = series["harmonics"][harmonic]
         smooth = harmonic in SMOOTH_HARMONICS and harmonic not in fits
-        for ax, draw in ((polar_axes[column], _polar_series), (linear_axes[column], _linear_series)):
-            draw(ax, series["angles"], total["mean"], total["std"], "tab:blue",
+        for panel, draw in ((ax, _linear_series), (inset, _polar_series)):
+            draw(panel, series["angles"], total["mean"], total["std"], "tab:blue",
                  label=f"{harmonic} total", smooth=smooth, floor=0.0)
             for name, color in zip(arms_of[harmonic], ARM_COLORS):
                 arm = series["channels"][name]
-                draw(ax, series["angles"], arm["mean"], arm["std"], color, label=name,
+                draw(panel, series["angles"], arm["mean"], arm["std"], color, label=name,
                      floor=0.0, alpha=0.12, linewidth=1.1, markersize=2.5)
 
         if smooth:
             minima = _harmonic_minima(series, harmonic)
-            _mark_minima(polar_axes[column], minima, to_x=np.deg2rad)
-            _mark_minima(linear_axes[column], minima, annotate=True,
-                         label="interpolated minimum")
+            _mark_minima(ax, minima, annotate=True, label="interpolated minimum")
+            _mark_minima(inset, minima, to_x=np.deg2rad)
             minima_rows.extend(_minima_rows(series["power_label"], harmonic, total["mean"], minima))
 
         fit = fits.get(harmonic)
         if fit is not None:
-            _draw_sinusoid(linear_axes[column], fit, circle_angles)
-            _draw_sinusoid(polar_axes[column], fit, circle_angles, to_x=np.deg2rad)
+            _draw_sinusoid(ax, fit, circle_angles)
+            _draw_sinusoid(inset, fit, circle_angles, to_x=np.deg2rad, mark_extrema=False)
 
         curves = [total["mean"]] + [series["channels"][name]["mean"] for name in arms_of[harmonic]]
-        _focus_radial(polar_axes[column], curves, floor=0.0)
-        _polar_style(polar_axes[column], f"{harmonic} intensity (counts/s)", series["clockwise"])
-        _focus_vertical(linear_axes[column], curves, floor=0.0)
-        _linear_style(linear_axes[column], f"{harmonic} intensity — linear axes",
-                      "counts/s", circle_angles, angle_name)
-        linear_axes[column].legend(fontsize=7, loc="best", framealpha=0.8)
+        _focus_radial(inset, curves, floor=0.0)
+        _focus_vertical(ax, curves, floor=0.0, headroom=0.62)
+        _linear_style(ax, f"{harmonic} intensity", "counts/s", circle_angles, angle_name)
+        ax.legend(fontsize=8.5, loc="upper left", framealpha=0.85)
 
-    _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
+    _save_grid_figure(fig, save_dir / "intensity_vs_angle.png")
     write_minima_csv(minima_rows, save_dir / ANGLE_MINIMA_CSV)
 
 
@@ -1833,7 +1878,7 @@ def plot_angle_g2(series: Dict[str, Any], save_dir: Path) -> None:
         _unity_circle(ax)
         _focus_radial(ax, [pairs[pair]["mean"]], floor=1.0)
         _polar_style(ax, _pair_label(pair), series["clockwise"])
-    _save_polar_figure(fig, save_dir / "g2_vs_angle.png")
+    _save_grid_figure(fig, save_dir / "g2_vs_angle.png")
 
 
 def plot_angle_r(series: Dict[str, Any], save_dir: Path) -> None:
@@ -1854,13 +1899,17 @@ def plot_angle_r(series: Dict[str, Any], save_dir: Path) -> None:
         _unity_circle(ax)
         _focus_radial(ax, [r_values[pair]["mean"]], floor=1.0)
         _polar_style(ax, f"R  {_pair_label(pair)}", series["clockwise"])
-    _save_polar_figure(fig, save_dir / "R_vs_angle.png")
+    _save_grid_figure(fig, save_dir / "R_vs_angle.png")
 
 
 def plot_angle_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
     """2×N polar grid: per harmonic, intensity on top and its auto-g²(0) below.
 
     Two harmonics → 4 panels; three harmonics → 6 panels.
+
+    This is where the intensity butterflies are read at full size, so the top row carries
+    all three curves of each harmonic: the two arms and the sum they make. intensity_vs_angle.png
+    shows the same three on linear axes, where a sweep's depth can be measured.
     """
     harmonics = sorted(series["harmonics"])
     auto_pairs = {harmonic_of(pair[0]): pair for pair in series["pairs"]
@@ -1868,8 +1917,9 @@ def plot_angle_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
     if not harmonics:
         return
 
+    fits = series.get("fits") or {}
     cols = len(harmonics)
-    fig, axes = plt.subplots(2, cols, figsize=(4.4 * cols, 9.0), dpi=300,
+    fig, axes = plt.subplots(2, cols, figsize=(4.8 * cols, 9.6), dpi=300,
                              subplot_kw={"projection": "polar"})
     axes = np.asarray(axes).reshape(2, cols)
     fig.suptitle(f"Harmonics vs {series.get('angle_name', 'angle')} — "
@@ -1877,14 +1927,27 @@ def plot_angle_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
                  fontsize=15, fontweight="bold")
 
     for column, harmonic in enumerate(harmonics):
+        ax = axes[0, column]
         signal = series["harmonics"][harmonic]
-        smooth = harmonic in SMOOTH_HARMONICS and harmonic not in (series.get("fits") or {})
-        _polar_series(axes[0, column], series["angles"], signal["mean"], signal["std"], "tab:blue",
-                      smooth=smooth, floor=0.0)
+        arms = sorted(name for name in series["channels"] if harmonic_of(name) == harmonic)
+        smooth = harmonic in SMOOTH_HARMONICS and harmonic not in fits
+        _polar_series(ax, series["angles"], signal["mean"], signal["std"], "tab:blue",
+                      label=f"{harmonic} total", smooth=smooth, floor=0.0)
+        for name, color in zip(arms, ARM_COLORS):
+            arm = series["channels"][name]
+            _polar_series(ax, series["angles"], arm["mean"], arm["std"], color, label=name,
+                          floor=0.0, alpha=0.12, linewidth=1.1, markersize=2.5)
         if smooth:
-            _mark_minima(axes[0, column], _harmonic_minima(series, harmonic), to_x=np.deg2rad)
-        _focus_radial(axes[0, column], [signal["mean"]], floor=0.0)
-        _polar_style(axes[0, column], f"{harmonic} intensity (counts/s)", series["clockwise"])
+            _mark_minima(ax, _harmonic_minima(series, harmonic), to_x=np.deg2rad)
+        if harmonic in fits:
+            # Extrema markers are for the linear intensity figure; on a polar panel they
+            # just pile on top of each other near the origin of a flat (circular) sweep.
+            _draw_sinusoid(ax, fits[harmonic], _circle_arrays(series["angles"])[0],
+                           to_x=np.deg2rad, mark_extrema=False)
+        _focus_radial(ax, [signal["mean"]] + [series["channels"][name]["mean"] for name in arms],
+                      floor=0.0)
+        _polar_style(ax, f"{harmonic} intensity (counts/s)", series["clockwise"])
+        ax.legend(fontsize=7, loc="lower left", bbox_to_anchor=(-0.12, -0.14), framealpha=0.85)
 
         pair = auto_pairs.get(harmonic)
         ax = axes[1, column]
@@ -1897,7 +1960,7 @@ def plot_angle_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
         _focus_radial(ax, [g2["mean"]], floor=1.0)
         _polar_style(ax, f"{harmonic} $g^{{(2)}}(0)$  ({pair[0]}–{pair[1]})", series["clockwise"])
 
-    _save_polar_figure(fig, save_dir / "harmonics_vs_angle.png")
+    _save_grid_figure(fig, save_dir / "harmonics_vs_angle.png")
 
 
 # ----------------------------------------------------------------------------
@@ -1923,13 +1986,15 @@ def plot_laser_angle_overlay(series_by_power: Dict[str, Dict[str, Any]], save_di
     angle_name = first.get("angle_name", "angle")
     title_suffix = ", ".join(powers)
 
-    # --- intensity: per harmonic, polar on top and the same curves linear below ---
+    # --- intensity: per harmonic, one large linear panel with a polar thumbnail ---
     harmonics = sorted({h for series in series_by_power.values() for h in series["harmonics"]})
     if harmonics:
-        fig, polar_axes, linear_axes = _two_row_grid(
+        fig, axes = _linear_row_grid(
             len(harmonics), f"Intensity vs {angle_name} — {title_suffix}")
         minima_rows: List[Dict[str, Any]] = []
         for column, harmonic in enumerate(harmonics):
+            ax = axes[column]
+            inset = _polar_inset(ax, clockwise)
             smooth = harmonic in SMOOTH_HARMONICS
             curves = []
             widest = None
@@ -1938,29 +2003,29 @@ def plot_laser_angle_overlay(series_by_power: Dict[str, Dict[str, Any]], save_di
                     continue
                 d = series["harmonics"][harmonic]
                 curves.append(d["mean"])
-                for ax, draw in ((polar_axes[column], _polar_series),
-                                 (linear_axes[column], _linear_series)):
-                    draw(ax, series["angles"], d["mean"], d["std"], colors[power],
+                for panel, draw in ((ax, _linear_series), (inset, _polar_series)):
+                    draw(panel, series["angles"], d["mean"], d["std"], colors[power],
                          label=power, alpha=0.18, smooth=smooth, floor=0.0)
                 if smooth:
                     # Rings only, no angle labels: with one set of minima per power the
                     # texts would land on each other. The angles are in the CSV.
                     minima = _harmonic_minima(series, harmonic)
-                    _mark_minima(polar_axes[column], minima, color=colors[power], to_x=np.deg2rad)
-                    _mark_minima(linear_axes[column], minima, color=colors[power])
+                    _mark_minima(ax, minima, color=colors[power])
+                    _mark_minima(inset, minima, color=colors[power], to_x=np.deg2rad)
                     minima_rows.extend(_minima_rows(power, harmonic, d["mean"], minima))
                 angles = _circle_arrays(series["angles"])[0]
                 if widest is None or angles[-1] - angles[0] > widest[-1] - widest[0]:
                     widest = angles
 
-            _focus_radial(polar_axes[column], curves, floor=0.0)
-            _polar_style(polar_axes[column], f"{harmonic} intensity (counts/s)", clockwise)
-            _focus_vertical(linear_axes[column], curves, floor=0.0)
+            _focus_radial(inset, curves, floor=0.0)
+            _focus_vertical(ax, curves, floor=0.0, headroom=0.62)
             if widest is not None:
-                _linear_style(linear_axes[column], f"{harmonic} intensity — linear axes",
-                              "counts/s", widest, angle_name)
-        _power_legend(fig, colors)
-        _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
+                _linear_style(ax, f"{harmonic} intensity", "counts/s", widest, angle_name)
+        # On this layout the figure-wide legend of the other three would sit on the polar
+        # inset of the last panel, so the powers are named inside the first panel instead.
+        axes[0].legend(fontsize=8.5, loc="upper left", framealpha=0.85, title="power",
+                       title_fontsize=8.5)
+        _save_grid_figure(fig, save_dir / "intensity_vs_angle.png")
         write_minima_csv(minima_rows, save_dir / ANGLE_MINIMA_CSV)
 
     # --- g2: one row per harmonic, its auto pair then a cross family ---
@@ -1974,7 +2039,7 @@ def plot_laser_angle_overlay(series_by_power: Dict[str, Dict[str, Any]], save_di
             _focus_radial(ax, curves, floor=1.0)
             _polar_style(ax, _pair_label(pair), clockwise)
         _power_legend(fig, colors)
-        _save_polar_figure(fig, save_dir / "g2_vs_angle.png")
+        _save_grid_figure(fig, save_dir / "g2_vs_angle.png")
 
     # --- R: one row per cross family ---
     r_names = sorted({pair for series in series_by_power.values() for pair in series.get("R", {})})
@@ -1989,7 +2054,7 @@ def plot_laser_angle_overlay(series_by_power: Dict[str, Dict[str, Any]], save_di
             _focus_radial(ax, curves, floor=1.0)
             _polar_style(ax, f"R  {pair[0]}–{pair[1]}", clockwise)
         _power_legend(fig, colors)
-        _save_polar_figure(fig, save_dir / "R_vs_angle.png")
+        _save_grid_figure(fig, save_dir / "R_vs_angle.png")
 
     # --- harmonics: intensity on top, auto-g2 below ---
     if harmonics:
@@ -2032,7 +2097,7 @@ def plot_laser_angle_overlay(series_by_power: Dict[str, Dict[str, Any]], save_di
             _focus_radial(ax, curves, floor=1.0)
             _polar_style(ax, f"{harmonic} $g^{{(2)}}(0)$  ({auto_pair[0]}–{auto_pair[1]})", clockwise)
         _power_legend(fig, colors)
-        _save_polar_figure(fig, save_dir / "harmonics_vs_angle.png")
+        _save_grid_figure(fig, save_dir / "harmonics_vs_angle.png")
 
     print(f"Laser angle overlay ({len(powers)} powers) -> {save_dir}")
 
@@ -2112,23 +2177,30 @@ def write_angle_summary_csv(series: Dict[str, Any], path: Path) -> Path:
 #
 # The harmonics leave the crystal, pass a half-wave plate, then a polarizer that never
 # moves. Turning the plate turns the polarization in front of that polarizer, so the
-# intensity it transmits traces a sinusoid of period 90 deg in plate angle:
+# intensity it transmits follows Malus' law in the plate angle:
 #
-#     I(theta) = offset + amplitude * cos(2*pi*(theta - phase) / 90 deg)
+#     I(theta) = I0 cos^2(factor (theta - theta0)) + floor
 #
-# What the shape says about the emission is entirely in the DEPTH of that sinusoid:
+# `factor` is 2 for a half-wave plate (a HWP turns the polarization by twice its own
+# angle, so the transmitted curve repeats every 90 deg) and 1 for a polarizer.
+#
+# What the shape says about the emission is entirely in how deep that curve goes:
 #
 #   * a curve reaching zero  -> one axis carries nothing         -> linear
 #   * a flat curve           -> both axes carry the same         -> circular
 #
-# Written as the modulation m = amplitude / offset, and the two intensities the fit
-# reaches, I_max = offset + amplitude and I_min = offset - amplitude:
+# The floor IS the smaller axis and the crest the larger one, so with
+# I_max = I0 + floor and I_min = floor (clipped at zero),
 #
-#     attenuation = I_min / I_max = (1 - m) / (1 + m)
+#     attenuation = I_min / I_max
 #     ellipticity = sqrt(attenuation)      i.e. the ratio of the ellipse's axes
 #
 # so ellipticity 0 is linear and 1 is circular. Repeating the sweep at several pump
 # (laser) angles is what gives ellipticity versus laser angle, the point of the scan.
+#
+# The model, the starting guesses and those two lines are the lab's own scan routine,
+# kept identical on purpose: a number quoted from this pipeline is the number that
+# routine would have given for the same sweep.
 #
 # Per power, under results/.../ellipticity/{power}/:
 #   lasXXXpY/  — the four vs-analyzer-angle figures of that sweep, the fitted sinusoid
@@ -2139,22 +2211,48 @@ def write_angle_summary_csv(series: Dict[str, Any], path: Path) -> Path:
 #   ../overlay/ — ellipticity and modulation versus laser angle, every power together
 
 
+def malus(angles_deg: Sequence[float], i0: float, theta0_deg: float, floor: float,
+          factor: float) -> np.ndarray:
+    """`i0 cos^2(factor (theta - theta0)) + floor`, every angle in degrees."""
+    turns = np.deg2rad(factor * (np.asarray(angles_deg, dtype=float) - theta0_deg))
+    return i0 * np.cos(turns) ** 2 + floor
+
+
 def sinusoid(angles_deg: np.ndarray, fit: Dict[str, Any]) -> np.ndarray:
     """The fitted curve evaluated at `angles_deg`."""
-    phase = 2.0 * np.pi * (np.asarray(angles_deg, dtype=float) - fit["phase_deg"]) / fit["period_deg"]
-    return fit["offset"] + fit["amplitude"] * np.cos(phase)
+    return malus(angles_deg, fit["i0"], fit["theta_deg"], fit["floor"], fit["fit_factor"])
+
+
+def fit_factor_of(period_deg: float) -> float:
+    """`cos^2(factor theta)` repeats every `180/factor` deg: 90 deg (a HWP) -> factor 2."""
+    return 180.0 / float(period_deg)
+
+
+def ellipticity_of(i_min: float, i_max: float) -> Tuple[float, float]:
+    """(attenuation, ellipticity) of the two intensities a fitted curve reaches.
+
+    attenuation = I_min/I_max, and the ellipticity is its square root: the ratio of the
+    ellipse's axes, 0 for a linear polarization and 1 for a circular one.
+    """
+    if not (i_max > 0) or not np.isfinite(i_min):
+        return float("nan"), float("nan")
+    attenuation = float(np.clip(i_min / i_max, 0.0, 1.0))
+    return attenuation, float(np.sqrt(attenuation))
 
 
 def fit_sinusoid(angles_deg: Sequence[float], values: Sequence[float],
                  period_deg: float = 90.0) -> Optional[Dict[str, Any]]:
-    """Fit `offset + amplitude*cos(2 pi (angle - phase)/period)` at a FIXED period.
+    """Fit Malus' law to one analyzer sweep, the way the lab's scan routine does.
 
-    Holding the period at the 90 deg a half-wave plate imposes leaves three linear
-    parameters, so the fit is a least-squares solve rather than an iteration that can
-    fail to converge on a nearly flat (circular) curve. The uncertainties are the usual
-    residual-based ones, propagated into the modulation and the ellipticity.
+    Kept deliberately identical to that routine: the `I0 cos^2 + floor` model, the
+    starting guesses taken from the measured extremes, `theta0` folded into `[0, 180)`,
+    the R^2 from the residuals, and the ellipticity read as `sqrt(I_min/I_max)` with
+    `I_min` clipped at zero. What is added is the covariance `curve_fit` already
+    computes, propagated into the error bars of the ellipticity figures, and a fallback
+    for the sweep `curve_fit` refuses.
 
-    Returns None when fewer than four angles carry a finite value.
+    Returns None when fewer than four angles carry a finite value: the model has three
+    free parameters.
     """
     angles = np.asarray(angles_deg, dtype=float)
     signal = np.asarray(values, dtype=float)
@@ -2163,72 +2261,134 @@ def fit_sinusoid(angles_deg: Sequence[float], values: Sequence[float],
         return None
     angles, signal = angles[finite], signal[finite]
 
-    turns = 2.0 * np.pi * angles / float(period_deg)
-    design = np.column_stack([np.cos(turns), np.sin(turns), np.ones_like(turns)])
-    (cosine, sine, offset), *_ = np.linalg.lstsq(design, signal, rcond=None)
-    amplitude = float(np.hypot(cosine, sine))
-    phase_deg = float(np.rad2deg(np.arctan2(sine, cosine)) * period_deg / 360.0 % period_deg)
+    factor = fit_factor_of(period_deg)
 
-    residuals = signal - design @ np.array([cosine, sine, offset])
-    rss = float(residuals @ residuals)
-    total = float(np.sum((signal - signal.mean()) ** 2))
-    dof = len(signal) - 3
-    covariance = np.linalg.pinv(design.T @ design) * (rss / dof if dof > 0 else np.nan)
+    def model(theta, i0, theta0, floor):
+        return malus(theta, i0, theta0, floor, factor)
 
-    # The amplitude is not a fitted parameter but the length of (cosine, sine), so its
-    # variance - and its covariance with the offset - come from that of the two.
-    if amplitude > 0:
-        amplitude_var = float(
-            cosine ** 2 * covariance[0, 0] + sine ** 2 * covariance[1, 1]
-            + 2.0 * cosine * sine * covariance[0, 1]) / amplitude ** 2
-        amplitude_offset_cov = float(cosine * covariance[0, 2] + sine * covariance[1, 2]) / amplitude
-    else:
-        amplitude_var = amplitude_offset_cov = float("nan")
+    floor_guess = float(np.min(signal))
+    guess = [float(np.max(signal)) - floor_guess, float(angles[np.argmax(signal)]), floor_guess]
+    try:
+        parameters, covariance = curve_fit(model, angles, signal, p0=guess, maxfev=10000)
+        method = "curve_fit"
+    except (RuntimeError, ValueError) as exc:
+        print(f"    curve fit failed ({exc}); falling back to the frequency projection.")
+        parameters, covariance = _projection_fit(angles, signal, factor)
+        method = "projection"
 
-    modulation = amplitude / offset if offset > 0 else float("nan")
-    modulation_var = (modulation ** 2 * (amplitude_var / amplitude ** 2
-                                         + covariance[2, 2] / offset ** 2
-                                         - 2.0 * amplitude_offset_cov / (amplitude * offset))
-                      if offset > 0 and amplitude > 0 else float("nan"))
-    modulation_std = float(np.sqrt(modulation_var)) if modulation_var >= 0 else float("nan")
-    attenuation, ellipticity, ellipticity_std = ellipticity_of(modulation, modulation_std)
+    (i0, theta0, floor), covariance = _crest_upwards(parameters, covariance, period_deg)
+    # A polarization direction lives in [0, 180), and for an integer factor that fold is a
+    # whole number of periods, so it names the same curve. It is what the lab reports.
+    # Beware that it does not make theta unique: with a HWP the curve repeats every 90 deg,
+    # so a fit lands on theta or theta+90 as it pleases. Compare sweeps modulo the period.
+    theta0 = float(theta0) % (180.0 if float(factor).is_integer() else period_deg)
+
+    residuals = signal - model(angles, i0, theta0, floor)
+    ss_res = float(residuals @ residuals)
+    ss_tot = float(np.sum((signal - signal.mean()) ** 2))
+
+    i_max, i_min = float(i0 + floor), float(max(0.0, floor))
+    attenuation, ellipticity = ellipticity_of(i_min, i_max)
+    # Written in the modulation of the equivalent sinusoid, m = (1-att)/(1+att): the same
+    # depth read as a fraction of the mean rather than as a ratio of the two extremes.
+    modulation = (1.0 - attenuation) / (1.0 + attenuation) if np.isfinite(attenuation) else float("nan")
+    attenuation_std = _attenuation_std(i0, floor, covariance)
+
+    dense = np.linspace(float(angles.min()), float(angles.max()), 500)
+    curve = model(dense, i0, theta0, floor)
 
     return {
         "n_points": int(len(signal)),
         "period_deg": float(period_deg),
-        "offset": float(offset),
-        "amplitude": amplitude,
-        "phase_deg": phase_deg,
+        "fit_factor": float(factor),
+        "method": method,
+        "i0": float(i0),
+        "floor": float(floor),
+        "theta_deg": theta0,
+        "theta_std_deg": _std_of(covariance, 1),
+        "i_max": i_max,
+        "i_min": i_min,
+        "angle_at_max_deg": float(dense[np.argmax(curve)]),
+        "angle_at_min_deg": float(dense[np.argmin(curve)]),
         "modulation": float(modulation),
-        "modulation_std": modulation_std,
+        "modulation_std": (2.0 * attenuation_std / (1.0 + attenuation) ** 2
+                           if np.isfinite(attenuation_std) else float("nan")),
         "ellipticity": ellipticity,
-        "ellipticity_std": ellipticity_std,
+        "ellipticity_std": (attenuation_std / (2.0 * ellipticity)
+                            if ellipticity > 0 and np.isfinite(attenuation_std) else float("nan")),
         "attenuation": attenuation,
-        "mean_intensity": float(offset),
-        "r_squared": float(1.0 - rss / total) if total > 0 else float("nan"),
-        "rmse": float(np.sqrt(rss / len(signal))),
+        "mean_intensity": float(floor + 0.5 * i0),
+        "r_squared": float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0,
+        "rmse": float(np.sqrt(ss_res / len(signal))),
     }
 
 
-def ellipticity_of(modulation: float, modulation_std: float = float("nan")) -> Tuple[float, float, float]:
-    """(attenuation, ellipticity, ellipticity std) of a modulation depth.
+def _projection_fit(angles_deg: np.ndarray, values: np.ndarray,
+                    factor: float) -> Tuple[np.ndarray, np.ndarray]:
+    """The fallback: the sweep's Fourier component at the model's own frequency.
 
-    attenuation = I_min/I_max = (1-m)/(1+m), and the ellipticity is its square root: the
-    ratio of the ellipse's axes, 0 for a linear polarization and 1 for a circular one.
-    Noise can push a fitted m just past 1 (a curve reaching slightly below zero), which
-    is a linear polarization measured with a small negative excursion: it is clipped to
-    0 rather than turned into a NaN.
+    `I0 cos^2(f(theta-theta0)) + floor` is `(floor + I0/2) + (I0/2) cos(2f(theta-theta0))`,
+    so projecting the samples onto that one frequency gives all three parameters in a
+    single linear solve. It cannot fail to converge - there is nothing to converge - which
+    is the point of having it: a nearly flat (circular) sweep is exactly where a
+    nonlinear fit is most likely to give up, and it is not a sweep to discard.
     """
-    if not np.isfinite(modulation):
-        return float("nan"), float("nan"), float("nan")
-    attenuation = float(np.clip((1.0 - modulation) / (1.0 + modulation), 0.0, 1.0))
-    ellipticity = float(np.sqrt(attenuation))
-    if ellipticity > 0 and np.isfinite(modulation_std):
-        # d(eps)/dm = -1 / ((1+m)^2 eps)
-        ellipticity_std = float(modulation_std / ((1.0 + modulation) ** 2 * ellipticity))
-    else:
-        ellipticity_std = float("nan")
-    return attenuation, ellipticity, ellipticity_std
+    turns = np.deg2rad(2.0 * factor * angles_deg)
+    design = np.column_stack([np.cos(turns), np.sin(turns), np.ones_like(turns)])
+    (cosine, sine, mean), *_ = np.linalg.lstsq(design, values, rcond=None)
+    amplitude = float(np.hypot(cosine, sine))
+    theta0 = float(np.rad2deg(np.arctan2(sine, cosine)) / (2.0 * factor))
+
+    residuals = values - design @ np.array([cosine, sine, mean])
+    dof = len(values) - 3
+    scale = float(residuals @ residuals) / dof if dof > 0 else float("nan")
+    # In (cos, sin, mean); the caller only reads the I0/floor block, so the off-diagonal
+    # terms of the projection are not worth carrying through the change of variables.
+    spread = np.linalg.pinv(design.T @ design) * scale
+    covariance = np.full((3, 3), float("nan"))
+    covariance[0, 0] = 4.0 * (spread[0, 0] + spread[1, 1])          # var(I0) = var(2A)
+    covariance[2, 2] = spread[2, 2] + covariance[0, 0] / 4.0        # var(mean - A)
+    covariance[0, 2] = covariance[2, 0] = -covariance[0, 0] / 2.0
+    covariance[1, 1] = 0.0
+    return np.array([2.0 * amplitude, theta0, mean - amplitude]), covariance
+
+
+def _crest_upwards(parameters: Sequence[float], covariance: np.ndarray,
+                   period_deg: float) -> Tuple[Tuple[float, float, float], np.ndarray]:
+    """Rewrite a fit that landed on the trough so that `i0` is positive.
+
+    `-|I0| cos^2(x) + floor` is `|I0| cos^2(x + 90/factor) + (floor - |I0|)`: the same
+    curve, but with the floor where the physics expects it - the smaller axis of the
+    ellipse. Without this a fit that converged half a period out would report an
+    ellipticity above 1. The covariance follows the same change of variables.
+    """
+    i0, theta0, floor = (float(value) for value in parameters)
+    if i0 >= 0:
+        return (i0, theta0, floor), covariance
+
+    jacobian = np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1.0]])
+    return ((-i0, theta0 + 0.5 * period_deg, floor + i0),
+            jacobian @ covariance @ jacobian.T)
+
+
+def _attenuation_std(i0: float, floor: float, covariance: np.ndarray) -> float:
+    """The error on I_min/I_max, from the fit's own covariance in (I0, floor).
+
+    NaN when the fit could not estimate that covariance, which is what a sweep the model
+    matches exactly does: no error bar is then better than a made-up one.
+    """
+    block = covariance[np.ix_((0, 2), (0, 2))]
+    i_max = i0 + floor
+    if not (i_max > 0) or not np.all(np.isfinite(block)):
+        return float("nan")
+    variance = (i0 ** 2 * block[1, 1] + floor ** 2 * block[0, 0]
+                - 2.0 * i0 * floor * block[0, 1]) / i_max ** 4
+    return float(np.sqrt(variance)) if variance > 0 else float("nan")
+
+
+def _std_of(covariance: np.ndarray, index: int) -> float:
+    variance = float(covariance[index, index])
+    return float(np.sqrt(variance)) if np.isfinite(variance) and variance > 0 else float("nan")
 
 
 def fit_angle_series(series: Dict[str, Any], period_deg: float = 90.0) -> Dict[str, Dict[str, Any]]:
@@ -2286,9 +2446,10 @@ def plot_ellipticity_power(cfg: ExperimentConfig,
         sweeps.append({"laser_angle_deg": float(laser_angle), "series": series,
                        "fits": fits["harmonics"]})
         for harmonic, fit in sorted(fits["harmonics"].items()):
-            print(f"    {harmonic}: modulation {fit['modulation']:.4f}, "
-                  f"ellipticity {fit['ellipticity']:.4f} "
-                  f"(R² {fit['r_squared']:.4f})")
+            print(f"    {harmonic}: ε {fit['ellipticity']:.4f}, θ {fit['theta_deg']:.2f}°, "
+                  f"I_max {fit['i_max']:.4g} at {fit['angle_at_max_deg']:.1f}°, "
+                  f"I_min {fit['i_min']:.4g} at {fit['angle_at_min_deg']:.1f}° "
+                  f"(m {fit['modulation']:.4f}, R² {fit['r_squared']:.4f})")
 
     if not sweeps:
         print(f"Ellipticity [{power}]: no sweep held enough data.")
@@ -2541,7 +2702,8 @@ def _fit_series(sweeps: Sequence[Dict[str, Any]], harmonic: str,
 
 SINUSOID_CSV_COLUMNS = [
     "power_label", "laser_angle_deg", "kind", "target", "n_points", "period_deg",
-    "offset", "amplitude", "phase_deg", "modulation", "modulation_std", "ellipticity",
+    "fit_factor", "method", "i0", "floor", "theta_deg", "theta_std_deg", "i_max", "i_min",
+    "angle_at_max_deg", "angle_at_min_deg", "modulation", "modulation_std", "ellipticity",
     "ellipticity_std", "attenuation", "r_squared", "rmse",
 ]
 
@@ -2563,10 +2725,12 @@ def _fit_rows(power: str, laser_angle_deg: float,
                 "laser_angle_deg": f"{laser_angle_deg:g}",
                 "kind": kind,
                 "target": target,
+                "method": fit["method"],
                 **{key: _number(fit[key]) for key in
-                   ("n_points", "period_deg", "offset", "amplitude", "phase_deg",
-                    "modulation", "modulation_std", "ellipticity", "ellipticity_std",
-                    "attenuation", "r_squared", "rmse")},
+                   ("n_points", "period_deg", "fit_factor", "i0", "floor", "theta_deg",
+                    "theta_std_deg", "i_max", "i_min", "angle_at_max_deg",
+                    "angle_at_min_deg", "modulation", "modulation_std", "ellipticity",
+                    "ellipticity_std", "attenuation", "r_squared", "rmse")},
             })
     return rows
 

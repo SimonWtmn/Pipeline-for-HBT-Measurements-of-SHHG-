@@ -149,8 +149,8 @@ class ExperimentConfig:
     ELLIPTICITY_ANALYZER_DRY_RUN: bool = False
     ELLIPTICITY_ANALYZER_SETTLE_TIME_S: float = 0.2
     # A half-wave plate turns the polarization by twice its own angle, so what the fixed
-    # polarizer transmits repeats every 90 deg of plate angle. That is the period the
-    # sinusoidal fit is held at; change it only if the analyzer is not a HWP.
+    # polarizer transmits repeats every 90 deg of plate angle. That is the period of the
+    # fitted Malus curve; change it only if the analyzer is not a HWP.
     ELLIPTICITY_FIT_PERIOD_DEG: float = 90.0
     #: Metadata only: the angle of the fixed polarizer after the plate (0 = vertical).
     ELLIPTICITY_FIXED_POLARIZER_DEG: float = 0.0
@@ -268,10 +268,10 @@ class ExperimentConfig:
         analyzer_angles = [float(angle) for angle in self.ELLIPTICITY_ANALYZER_ANGLES]
         if len(analyzer_angles) < 4:
             raise ValueError(
-                "ELLIPTICITY_ANALYZER_ANGLES needs at least 4 angles: the sinusoid fitted "
-                "to the analyzer sweep has three free parameters (offset, amplitude, "
-                f"phase), and got {len(analyzer_angles)} point(s). A typical sweep is "
-                "np.arange(0.0, 180.0, 15.0)."
+                "ELLIPTICITY_ANALYZER_ANGLES needs at least 4 angles: the Malus curve "
+                "fitted to the analyzer sweep has three free parameters (amplitude, "
+                f"angle, floor), and got {len(analyzer_angles)} point(s). A typical sweep "
+                "is np.arange(0.0, 180.0, 15.0)."
             )
         if self.ELLIPTICITY_FIT_PERIOD_DEG <= 0:
             raise ValueError(

@@ -96,9 +96,7 @@ CONFIG = ExperimentConfig(
     POWER_SCAN_STOP_ON_ERROR=True,
 
     # ----------------- the pump mounts (both angle scans) -----------------
-    # P1 and the HWP before the crystal: P1 turns to the laser angle, the HWP sets the
-    # power there from the calibration table.
-    # PUMP_POWER=90,                          # ignored while PUMP_POWER_SCAN is set
+    PUMP_POWER=90,
     # PUMP_POWER_SCAN=[                       # the whole scan at each power, one run
     #     {"power": "90mW", "requested_power": 90.0},
     #     {"power": "70mW", "requested_power": 70.0},
@@ -106,39 +104,36 @@ CONFIG = ExperimentConfig(
     #     {"power": "30mW", "requested_power": 30.0},
     #     {"power": "20mW", "requested_power": 20.0},
     # ],
-    # PUMP_CALIBRATION=None,                  # None -> linear_polarization_lookup_latest.npz
-    # PUMP_CALIBRATION_DIR=None,              # None -> polarization_calibration/
-    # PUMP_STAGE_ENABLED=True,
-    # PUMP_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
-    # PUMP_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
-    # PUMP_SETTLE_TIME_S=0.2,
-    # PUMP_STAGE_DRY_RUN=False,               # rehearse first; set False to move the mounts
+    PUMP_CALIBRATION=None,                  # None -> linear_polarization_lookup_latest.npz
+    PUMP_CALIBRATION_DIR=None,              # None -> polarization_calibration/
+    PUMP_STAGE_ENABLED=True,
+    PUMP_P1=RotationStageConfig(serial_number="27270550", clockwise=True),
+    PUMP_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
+    PUMP_SETTLE_TIME_S=0.2,
+    PUMP_STAGE_DRY_RUN=False,               # rehearse first; set False to move the mounts
 
     # ----------------- laser angle scan -----------------
-    # One acquisition per pump angle: what the crystal emits as its axes turn.
     LASER_ANGLE_SCAN=None,
     # LASER_ANGLE_SCAN=np.arange(0.0, 360.0, 15.0),
     # LASER_ANGLE_PLOT_ANGLES=False,          # summaries only; True to also analyse each angle
 
     # ----------------- ellipticity scan -----------------
-    # A whole analyzer sweep at each pump angle: the HWP after the crystal is turned in
-    # front of the fixed polarizer, and the depth of the sinusoid it transmits gives the
-    # ellipticity of the harmonics at that pump angle.
-    ELLIPTICITY_LASER_ANGLES=None,
-    # ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],          # the outer loop
-    # ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),   # the inner loop
-    # ELLIPTICITY_ANALYZER_ENABLED=True,
-    # ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
-    # ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
-    # ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
-    # ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # 90 deg for a half-wave plate
-    # ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata: 0 = vertical
-    # ELLIPTICITY_PLOT_POINTS=False,          # True to also analyse every single point
+    # ELLIPTICITY_LASER_ANGLES=None,
+    ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],          # the outer loop
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),   # the inner loop
+    ELLIPTICITY_ANALYZER_ENABLED=True,
+    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
+    ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
+    ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
+    ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # 90 deg for a half-wave plate, 180 def for a quarter-wave plate
+    ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata: 0 = vertical
+    ELLIPTICITY_PLOT_POINTS=False,          # True to also analyse every single point
 
+    # ----------------- analysis -----------------
     INTEGRATION_WINDOW=8,
     INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
-    RUN_ANALYSIS_AFTER_ACQUIRE=False,
-    ANALYZE_ONLY=True,
+    RUN_ANALYSIS_AFTER_ACQUIRE=True,
+    ANALYZE_ONLY=False,
 )
 
 

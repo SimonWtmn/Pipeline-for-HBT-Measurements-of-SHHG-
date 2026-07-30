@@ -49,8 +49,8 @@ FREQUENCY = 18.66e6
 #
 #     I(theta) = I_las * (1 + m cos(2 pi theta / 90 deg)),   m = (1-eps^2)/(1+eps^2)
 #
-# which is the relation `pkl_json_analyze.ellipticity_of` inverts, so a replay must
-# return the eps that went in.
+# which is the Malus curve `pkl_json_analyze.fit_sinusoid` fits, written about its own
+# mean, so a replay must return the eps that went in.
 
 BRIGHTNESS = {"H3": 40000.0, "H4": 12000.0}   # counts/s per harmonic at its brightest
 ARM_SPLIT = {"T": 0.48, "R": 0.52}            # the beamsplitter, deliberately imperfect
