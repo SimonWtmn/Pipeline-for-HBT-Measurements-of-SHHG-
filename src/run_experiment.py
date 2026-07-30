@@ -46,22 +46,22 @@ except ImportError:
 CONFIG = ExperimentConfig(
     # ----------------- identity -----------------
     MATERIAL="CdTe110",
-    EXPERIENCE_TYPE="Powerscan_NewSetup",
-    DATE="21072026",
-    POWER_LEVELS=["10.04mW", "15.5mW", "20.02mW", "24.96mW", "30mW", "35mW", "40.1mW"],
+    EXPERIENCE_TYPE="Ellipticity_Scan",
+    DATE="31072026",
+    POWER_LEVEL="30mW",
 
     # ----------------- optics / metadata -----------------
     FREQUENCY=18.66e6,
-    MODES={1: "H4R", 2: "H4T", 3: "H5R", 4: "H5T", 5: "H3R", 6: "H3T"},
-    P1={"present": False, "angle_deg": 0.0},
+    MODES={1: "H3T", 2: "H3R", 3: "H4T", 4: "H4R", 5: "H5T", 6: "H5R"},
+    P1={"present": True, "angle_deg": "unknown"},
     P2={"present": False, "angle_deg": 0.0},
     P3={"present": False, "angle_deg": 0.0},
     HWP_ANGLE_DEG=0.0,
-    COVER={"present": False, "description": "between channels"},
+    COVER={"present": True, "description": "between channels"},
     FILTERS={
-        "H3": {"separation": "unknown", "filter": "unknown"},
-        "H4": {"separation": "unknown", "filter": "unknown"},
-        "H5": {"separation": "unknown", "filter": "unknown"},
+        "H3": {"separation": "per-channel", "filter": "700-40"},
+        "H4": {"separation": "per-channel", "filter": "520-40"},
+        "H5": {"separation": "per-channel", "filter": "400-20"},
     },
 
     # ----------------- Time Tagger -----------------
@@ -71,8 +71,8 @@ CONFIG = ExperimentConfig(
     DEADTIMES_PS={},
     CORR_BINWIDTH_PS=300,
     CORR_N_BINS=2009,
-    ACQUISITION_DURATION_S=40,
-    CHUNK_DURATION_S=8,
+    ACQUISITION_DURATION_S=15,
+    CHUNK_DURATION_S=3,
     SAVE_MERGED=True,
     EXPORT_FORMAT="pkl",
     SAVE_RAW_TTBIN=False,
@@ -96,7 +96,7 @@ CONFIG = ExperimentConfig(
     POWER_SCAN_STOP_ON_ERROR=True,
 
     # ----------------- the pump mounts (both angle scans) -----------------
-    PUMP_POWER=90,
+    PUMP_POWER=30,
     # PUMP_POWER_SCAN=[                       # the whole scan at each power, one run
     #     {"power": "90mW", "requested_power": 90.0},
     #     {"power": "70mW", "requested_power": 70.0},
@@ -119,10 +119,12 @@ CONFIG = ExperimentConfig(
 
     # ----------------- ellipticity scan -----------------
     # ELLIPTICITY_LASER_ANGLES=None,
-    ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],          # the outer loop
-    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),   # the inner loop
+    ELLIPTICITY_LASER_ANGLES=np.union1d(
+        np.arange(0.0, 181.0, 4.0), [18.0]
+    ),          # the outer loop
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 4.0),   # the inner loop
     ELLIPTICITY_ANALYZER_ENABLED=True,
-    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
+    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27264707", clockwise=True),
     ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
     ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
     ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # 90 deg for a half-wave plate, 180 def for a quarter-wave plate
@@ -193,26 +195,33 @@ def acquire(cfg: ExperimentConfig) -> List[Run]:
     if cfg.is_laser_angle_scan():
         return acquire_laser_angle_scan(cfg)
 
+    try:
+        from acquisition import open_tagger
+    except ImportError:
+        from src.acquisition import open_tagger
+
     points = cfg.power_scan_points() or [(cfg.POWER_LEVEL, cfg.ROTATION_ANGLE_DEG)]
     stage = open_stage(cfg)
     runs: List[Run] = []
 
     try:
-        for number, (power, angle) in enumerate(points, start=1):
-            if len(points) > 1:
-                print(f"\n===== power point {number}/{len(points)}: {power} =====")
-            step = cfg.for_power(power, angle)
+        # One tagger connection for the whole power scan (or the single point).
+        with open_tagger(cfg) as tagger:
+            for number, (power, angle) in enumerate(points, start=1):
+                if len(points) > 1:
+                    print(f"\n===== power point {number}/{len(points)}: {power} =====")
+                step = cfg.for_power(power, angle)
 
-            if stage is not None and angle is not None:
-                stage.move_to_angle_deg(angle)
+                if stage is not None and angle is not None:
+                    stage.move_to_angle_deg(angle)
 
-            try:
-                runs.append((step, acquire_one(step)))
-            except Exception as exc:
-                record_run(step, status="failed")
-                print(f"Power point {power} failed: {exc}")
-                if cfg.POWER_SCAN_STOP_ON_ERROR:
-                    raise
+                try:
+                    runs.append((step, acquire_one(step, tagger=tagger)))
+                except Exception as exc:
+                    record_run(step, status="failed")
+                    print(f"Power point {power} failed: {exc}")
+                    if cfg.POWER_SCAN_STOP_ON_ERROR:
+                        raise
     finally:
         if stage is not None:
             stage.disconnect()
@@ -220,7 +229,7 @@ def acquire(cfg: ExperimentConfig) -> List[Run]:
     return runs
 
 
-def acquire_one(cfg: ExperimentConfig, log_run: bool = True) -> Any:
+def acquire_one(cfg: ExperimentConfig, log_run: bool = True, tagger: Any = None) -> Any:
     if log_run:
         print(f"Configuration file: {record_run(cfg)}")
 
@@ -229,7 +238,7 @@ def acquire_one(cfg: ExperimentConfig, log_run: bool = True) -> Any:
     except ImportError:
         from src.acquisition import run_acquisition
 
-    result = run_acquisition(cfg)
+    result = run_acquisition(cfg, session=tagger)
     if log_run:
         record_run(cfg, result)
 
@@ -241,22 +250,28 @@ def acquire_one(cfg: ExperimentConfig, log_run: bool = True) -> Any:
 def acquire_laser_angle_scan(cfg: ExperimentConfig) -> List[Run]:
     """Record a laser angle scan at one power, or at each power of a multi-power run.
 
-    A multi-power run (PUMP_POWER_SCAN) opens the two pump mounts once and drives a full
-    angle scan at every power in turn. `with` releases both mounts even when a preflight
-    or configuration-file write raises before the first acquisition.
+    A multi-power run (PUMP_POWER_SCAN) opens the two pump mounts and the Time Tagger
+    once, then drives a full angle scan at every power in turn. `with` releases the
+    mounts and the tagger even when a preflight or configuration-file write raises
+    before the first acquisition.
     """
+    try:
+        from acquisition import open_tagger
+    except ImportError:
+        from src.acquisition import open_tagger
+
     power_points = cfg.pump_power_points()
     log = hardware.LaserAngleLog(cfg.laser_angle_log_path())
     runs: List[Run] = []
     series_by_power: dict = {}
 
-    with open_pump(cfg) as pump:
+    with open_pump(cfg) as pump, open_tagger(cfg) as tagger:
         for number, (label, requested) in enumerate(power_points, start=1):
             if len(power_points) > 1:
                 print(f"\n########## power {number}/{len(power_points)}: "
                       f"{label} ({requested:g} {pump.lookup.unit}) ##########")
             power_cfg = cfg.for_pump_scan_power(label, requested)
-            runs.extend(acquire_laser_angle_power(power_cfg, pump, log))
+            runs.extend(acquire_laser_angle_power(power_cfg, pump, log, tagger=tagger))
 
             # Draw this power's vs-angle summary the moment its scan finishes, so a long
             # multi-power campaign shows results as it goes - and a completed power keeps
@@ -274,8 +289,9 @@ def acquire_laser_angle_scan(cfg: ExperimentConfig) -> List[Run]:
 
 
 def acquire_laser_angle_power(cfg: ExperimentConfig, pump: "hardware.PumpController",
-                              log: "hardware.LaserAngleLog") -> List[Run]:
-    """One full angle scan at a single power, on an already-open pump controller."""
+                              log: "hardware.LaserAngleLog",
+                              tagger: Any = None) -> List[Run]:
+    """One full angle scan at a single power, on an already-open pump and tagger."""
     points = cfg.laser_angle_scan_points()
     runs: List[Run] = []
 
@@ -295,7 +311,7 @@ def acquire_laser_angle_power(cfg: ExperimentConfig, pump: "hardware.PumpControl
             log.record(label, setting, status="running")
 
             try:
-                result = acquire_one(step, log_run=False)
+                result = acquire_one(step, log_run=False, tagger=tagger)
                 runs.append((step, result))
                 log.record(label, setting, status="complete", result=result)
             except Exception as exc:
@@ -312,22 +328,28 @@ def acquire_laser_angle_power(cfg: ExperimentConfig, pump: "hardware.PumpControl
 def acquire_ellipticity_scan(cfg: ExperimentConfig) -> List[Run]:
     """Record an analyzer sweep at every laser angle, at one power or at several.
 
-    The pump mounts and the analyzer plate are opened once for the whole run: three
-    mounts stay connected while the two nested loops (power, then laser angle, then
-    analyzer angle) drive them. `with` releases all three whatever raises.
+    The pump mounts, the analyzer plate, and the Time Tagger are opened once for the
+    whole run: three mounts and one tagger stay connected while the nested loops
+    (power, then laser angle, then analyzer angle) drive them. `with` releases all
+    four whatever raises.
     """
+    try:
+        from acquisition import open_tagger
+    except ImportError:
+        from src.acquisition import open_tagger
+
     power_points = cfg.pump_power_points()
     log = hardware.EllipticityLog(cfg.ellipticity_log_path())
     runs: List[Run] = []
     by_power: dict = {}
 
-    with open_pump(cfg) as pump, open_analyzer(cfg) as analyzer:
+    with open_pump(cfg) as pump, open_analyzer(cfg) as analyzer, open_tagger(cfg) as tagger:
         for number, (label, requested) in enumerate(power_points, start=1):
             if len(power_points) > 1:
                 print(f"\n########## power {number}/{len(power_points)}: "
                       f"{label} ({requested:g} {pump.lookup.unit}) ##########")
             power_cfg = cfg.for_pump_scan_power(label, requested)
-            runs.extend(acquire_ellipticity_power(power_cfg, pump, analyzer, log))
+            runs.extend(acquire_ellipticity_power(power_cfg, pump, analyzer, log, tagger=tagger))
 
             if cfg.RUN_ANALYSIS_AFTER_ACQUIRE:
                 campaign = plot_ellipticity_power(power_cfg, label)
@@ -342,12 +364,14 @@ def acquire_ellipticity_scan(cfg: ExperimentConfig) -> List[Run]:
 
 def acquire_ellipticity_power(cfg: ExperimentConfig, pump: "hardware.PumpController",
                               analyzer: "hardware.AnalyzerController",
-                              log: "hardware.EllipticityLog") -> List[Run]:
+                              log: "hardware.EllipticityLog",
+                              tagger: Any = None) -> List[Run]:
     """Every (laser angle, analyzer angle) pair of one power, in run order.
 
     The pump is set once per laser angle and the analyzer turns through its whole sweep
     there: the pump mounts move a few times, the analyzer many, which is both the
-    quickest order and the one that keeps a sweep internally consistent.
+    quickest order and the one that keeps a sweep internally consistent. The Time Tagger
+    stays connected for the whole power (opened by the caller).
     """
     laser_angles = cfg.ellipticity_laser_angles()
     runs: List[Run] = []
@@ -377,7 +401,7 @@ def acquire_ellipticity_power(cfg: ExperimentConfig, pump: "hardware.PumpControl
                 log.record(label, laser_angle, analyzer_angle, setting, status="running")
 
                 try:
-                    result = acquire_one(step, log_run=False)
+                    result = acquire_one(step, log_run=False, tagger=tagger)
                     runs.append((step, result))
                     log.record(label, laser_angle, analyzer_angle, setting,
                                status="complete", result=result)

@@ -813,7 +813,13 @@ def _yes_no(value: bool) -> str:
 
 def _polarizer(polarizer: Dict[str, Any]) -> str:
     present = polarizer.get("present", polarizer.get("here", False))
-    return f"present at {polarizer.get('angle_deg', 0):g} deg" if present else "absent"
+    if not present:
+        return "absent"
+    angle = polarizer.get("angle_deg", 0)
+    try:
+        return f"present at {float(angle):g} deg"
+    except (TypeError, ValueError):
+        return f"present at {angle}"  # e.g. "unknown"
 
 
 def _cover(cover: Dict[str, Any]) -> str:

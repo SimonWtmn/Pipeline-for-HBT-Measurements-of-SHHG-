@@ -5,12 +5,15 @@ chunks. Each chunk gets its own fresh measurements, so the spread between chunks
 genuine error bar; their sum is the optional merged file, and copies of that running
 sum are the stability snapshots.
 
+Angle scans open the tagger once via `open_tagger` and pass that session into every
+`run_acquisition` call, so changing the laser or analyzer angle does not reconnect.
+
 The second half of the file is the on-disk schema: `build_payload` turns Time Tagger
 measurement objects into the exact dict `pkl_json_analyze.get_data` expects, and
 `save_payload` writes it.
 
-The TimeTagger import happens inside `run_acquisition`, not at module import, so
-everything else in the pipeline works on a machine without the SDK.
+The TimeTagger import happens inside `open_tagger` / `run_acquisition`, not at module
+import, so everything else in the pipeline works on a machine without the SDK.
 """
 
 from __future__ import annotations
@@ -55,8 +58,43 @@ class AcquisitionResult:
     duration_s: float = 0.0
 
 
-def run_acquisition(cfg: ExperimentConfig) -> AcquisitionResult:
-    tt = _import_timetagger()
+class TaggerSession:
+    """Connected Time Tagger kept open across many acquisitions of one scan.
+
+    Use as a context manager (`with open_tagger(cfg) as tagger:`) so the device is
+    always released, then pass the session into each `run_acquisition` call.
+    """
+
+    def __init__(self, cfg: ExperimentConfig) -> None:
+        self.cfg = cfg
+        self.tt: Any = None
+        self.tagger: Any = None
+
+    def __enter__(self) -> "TaggerSession":
+        self.tt = _import_timetagger()
+        self.tagger = _connect(self.tt, self.cfg)
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self.tt is None or self.tagger is None:
+            return
+        self.tt.freeTimeTagger(self.tagger)
+        self.tagger = None
+        print("Time Tagger released.")
+
+
+def open_tagger(cfg: ExperimentConfig) -> TaggerSession:
+    """Not connected yet: use as a context manager to keep one connection for a scan."""
+    return TaggerSession(cfg)
+
+
+def run_acquisition(cfg: ExperimentConfig,
+                    session: Optional[TaggerSession] = None) -> AcquisitionResult:
+    """Record one acquisition. Reuses `session` when provided; otherwise connects once."""
     pairs = cfg.correlation_pairs()
     if not pairs:
         raise ValueError("No correlation pairs: check MODES / REGISTERED_CHANNELS.")
@@ -65,7 +103,14 @@ def run_acquisition(cfg: ExperimentConfig) -> AcquisitionResult:
     print(f"Acquiring {cfg.ACQUISITION_DURATION_S:g}s as {len(durations)} chunk(s) of "
           f"{cfg.CHUNK_DURATION_S:g}s | {len(pairs)} correlation pairs")
 
-    tagger = _connect(tt, cfg)
+    owns_session = session is None
+    if owns_session:
+        tt = _import_timetagger()
+        tagger = _connect(tt, cfg)
+    else:
+        tt = session.tt
+        tagger = session.tagger
+
     cumulative = _Cumulative(pairs)
     snapshots = _SnapshotRecorder(cfg, pairs) if cfg.STABILITY_ENABLED else None
     progress = _ProgressLogger(cfg.ACQUISITION_DURATION_S)
@@ -120,8 +165,9 @@ def run_acquisition(cfg: ExperimentConfig) -> AcquisitionResult:
         if writer is not None:
             writer.stop()
             print(f"  raw stream: {writer.getTotalSize() / (1024 ** 2):.1f} MiB")
-        tt.freeTimeTagger(tagger)
-        print("Time Tagger released.")
+        if owns_session:
+            tt.freeTimeTagger(tagger)
+            print("Time Tagger released.")
 
     return result
 
@@ -189,24 +235,26 @@ def _acquire_chunk(
     # device is perfectly fine. Only bail out if capture time truly stops advancing.
     last_elapsed = 0.0
     last_progress = time.monotonic()
-    while True:
-        elapsed = probe.getCaptureDuration() / 1e12
-        on_poll(elapsed, correlations, countrate)
-        if elapsed >= duration_s:
-            break
-        now = time.monotonic()
-        if elapsed > last_elapsed:
-            last_elapsed = elapsed
-            last_progress = now
-        elif now - last_progress > STALL_TIMEOUT_S:
-            raise TimeoutError(
-                f"Tagger stalled: capture stuck at {elapsed:.1f}s out of {duration_s:g}s "
-                f"for over {STALL_TIMEOUT_S:g}s. Check that the device is still connected."
-            )
-        time.sleep(POLL_INTERVAL_S)
-
-    for measurement in measurements:
-        measurement.stop()
+    try:
+        while True:
+            elapsed = probe.getCaptureDuration() / 1e12
+            on_poll(elapsed, correlations, countrate)
+            if elapsed >= duration_s:
+                break
+            now = time.monotonic()
+            if elapsed > last_elapsed:
+                last_elapsed = elapsed
+                last_progress = now
+            elif now - last_progress > STALL_TIMEOUT_S:
+                raise TimeoutError(
+                    f"Tagger stalled: capture stuck at {elapsed:.1f}s out of {duration_s:g}s "
+                    f"for over {STALL_TIMEOUT_S:g}s. Check that the device is still connected."
+                )
+            time.sleep(POLL_INTERVAL_S)
+    finally:
+        # Always stop before the next angle reuses the same tagger connection.
+        for measurement in measurements:
+            measurement.stop()
     return countrate, correlations
 
 
