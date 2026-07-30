@@ -315,6 +315,8 @@ class ExperimentConfig:
                 "unit of the calibration table (mW for a power-meter table). For several "
                 "powers in one run, use PUMP_POWER_SCAN instead."
             )
+        else:
+            _check_power_label_matches(self.POWER_LEVEL, self.PUMP_POWER, "POWER_LEVEL")
 
     def _validate_pump_stages(self, scan_field: str) -> None:
         if self.PUMP_STAGE_DRY_RUN:
@@ -350,6 +352,7 @@ class ExperimentConfig:
                 ) from None
             if value <= 0:
                 raise ValueError(f"{shape}: 'requested_power' must be > 0, got {value!r}")
+            _check_power_label_matches(label, value, "PUMP_POWER_SCAN 'power'")
             if label in seen:
                 # Two powers sharing a label would write over each other's files.
                 raise ValueError(f"PUMP_POWER_SCAN lists the power label {label!r} twice")
@@ -998,6 +1001,30 @@ def _reject_duplicate_angle_labels(angles: Sequence[float], field_name: str, tag
         raise ValueError(
             f"{field_name} maps several angles onto the same file label {duplicates}: "
             "angles must differ by at least 0.1 deg once wrapped into [0, 360)."
+        )
+
+
+def _check_power_label_matches(label: str, requested_power: float, field_name: str) -> None:
+    """Refuse a power label whose number contradicts the requested power.
+
+    The file label (`POWER_LEVEL`) and the beam power (`PUMP_POWER`) are two
+    independent fields: the first only names the files, the second is what the mounts
+    actually deliver. Leaving the label at its default while asking for another power
+    silently saves e.g. 90 mW data as "65mW". So whenever the label carries a number,
+    it must equal the requested power. Non-numeric labels ("low"/"high") are exempt:
+    there is nothing to cross-check, and they are a deliberate way to opt out.
+    """
+    digits = "".join(c for c in label if c.isdigit() or c == ".")
+    try:
+        labelled = float(digits)
+    except ValueError:
+        return  # non-numeric label (e.g. "low"): nothing to verify against the power
+    if abs(labelled - float(requested_power)) > 1e-9:
+        raise ValueError(
+            f"{field_name} label {label!r} does not match the requested power "
+            f"{requested_power:g} (calibration unit): the files would be saved as {label!r} "
+            f"while the beam is set to {requested_power:g}. Rename the label to match, e.g. "
+            f"\"{requested_power:g}mW\", or make it non-numeric (e.g. 'low') to opt out."
         )
 
 

@@ -63,6 +63,7 @@ BAND_ALPHA = 0.25                # opacity of the chunk-spread band on the polar
 ARM_COLORS = ("tab:orange", "tab:brown")   # the arms drawn beside a harmonic total
 SMOOTH_HARMONICS = ("H4",)       # harmonics drawn as a curve interpolated through the samples
 SMOOTH_SAMPLES_PER_STEP = 16     # density of that curve, per measured angle step
+MIN_TILE_SPAN_DEG = 45.0         # narrower arcs are zoom scans: draw them as measured, never tiled
 
 
 
@@ -1460,6 +1461,10 @@ def _fill_polar_circle(angles: np.ndarray, *series: np.ndarray):
     butterfly instead of a bare semicircle. The same tiling completes a 0-90 scan
     (four copies) or any arc whose span divides 360 evenly, while a genuine 0-360 scan
     is already full and is left untouched.
+
+    A narrow zoom scan (a few close angles taken to resolve one minimum) is not a
+    periodic unit of the pattern, so it is drawn as the measured arc rather than
+    replicated into a full circle: any span below MIN_TILE_SPAN_DEG is left as is.
     """
     angles = np.asarray(angles, dtype=float)
     if len(angles) < 2:
@@ -1468,6 +1473,8 @@ def _fill_polar_circle(angles: np.ndarray, *series: np.ndarray):
     span = angles[-1] - angles[0] + step
     if not (step > 0) or span >= 359.9:
         return (angles, *series)  # already (near) a full turn: nothing to copy
+    if span < MIN_TILE_SPAN_DEG:
+        return (angles, *series)  # a zoom scan, not a period to tile: draw the arc as measured
     copies = 360.0 / span
     n = int(round(copies))
     if n < 2 or abs(copies - n) > 1e-3:
