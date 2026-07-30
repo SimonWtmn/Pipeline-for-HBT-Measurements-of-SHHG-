@@ -51,6 +51,7 @@ script_path = Path(__file__).resolve().parent.parent
 
 Pair = Tuple[int, int]           # a channel pair, as the stability snapshots key them
 POLARIZATION_SUMMARY_CSV = "polarization_summary.csv"
+POLARIZATION_MINIMA_CSV = "interpolated_minima.csv"
 BAND_ALPHA = 0.25                # opacity of the chunk-spread band on the polar plots
 ARM_COLORS = ("tab:orange", "tab:brown")   # the arms drawn beside a harmonic total
 SMOOTH_HARMONICS = ("H4",)       # harmonics drawn as a curve interpolated through the samples
@@ -1112,7 +1113,8 @@ def _save_stability_figure(fig, path: Path) -> None:
 #
 # Four figures per power, under results/.../polarization/{power}/summary/:
 #   1. intensity_vs_angle.png  — per HARMONIC (total + its two arms): polar on top,
-#                                  the same curves on linear axes below
+#                                  the same curves on linear axes below. The angles of
+#                                  the interpolated minima land in interpolated_minima.csv
 #   2. g2_vs_angle.png         — one row per harmonic: its auto pair, then a whole
 #                                  cross family (33 | 34…, 44 | 35…, 55 | 45…)
 #   3. R_vs_angle.png          — one row per cross family (34…, 35…, 45…)
@@ -1447,29 +1449,66 @@ def _circle_arrays(angles: np.ndarray, *values: np.ndarray):
     return _close_polar_circle(*_fill_polar_circle(angles, *values))
 
 
-def _smooth_circle(angles: np.ndarray, values: np.ndarray, floor: Optional[float] = None):
-    """A cubic curve through the samples, so a sharp minimum reads as a dip.
+def _fit_circle_spline(angles: np.ndarray, values: np.ndarray):
+    """A cubic spline through the samples, and the angles it was fitted on.
 
     H4 nearly extinguishes between its lobes, and with one sample every 15 deg the
     straight segments between points cut the minimum off at whichever sample happened
     to sit closest to it. Interpolating (periodically when the scan covers the turn, so
     the curve joins itself smoothly at 0 deg) puts the missing curvature back without
-    moving any measured point. Returns None when there is too little to fit.
+    moving any measured point. Returns (None, None) when there is too little to fit.
     """
     angles = np.asarray(angles, dtype=float)
     values = np.asarray(values, dtype=float)
     finite = np.isfinite(values)
     if finite.sum() < 4:
-        return None
+        return None, None
     angles, values = angles[finite], values[finite]
 
     periodic = angles[-1] - angles[0] >= 359.9 and np.isclose(values[0], values[-1])
-    spline = CubicSpline(angles, values, bc_type="periodic" if periodic else "natural")
-    dense = np.linspace(angles[0], angles[-1], (len(angles) - 1) * SMOOTH_SAMPLES_PER_STEP + 1)
+    return CubicSpline(angles, values, bc_type="periodic" if periodic else "natural"), angles
+
+
+def _smooth_circle(angles: np.ndarray, values: np.ndarray, floor: Optional[float] = None):
+    """The interpolated curve, sampled densely enough to draw. None when it cannot fit."""
+    spline, fitted = _fit_circle_spline(angles, values)
+    if spline is None:
+        return None
+    dense = np.linspace(fitted[0], fitted[-1], (len(fitted) - 1) * SMOOTH_SAMPLES_PER_STEP + 1)
     smoothed = spline(dense)
     if floor is not None:
         smoothed = np.clip(smoothed, floor, None)
     return dense, smoothed
+
+
+def _curve_minima(angles: np.ndarray, values: np.ndarray,
+                  floor: Optional[float] = None) -> List[Tuple[float, float]]:
+    """Angle and depth of every local minimum of the interpolated curve.
+
+    The roots of the spline derivative give the extrema in closed form, so a minimum is
+    located between the measured angles instead of being pinned to whichever one came
+    closest. Only minima in the lower half of the curve's range are kept: a spline
+    through noisy samples also wobbles near the lobe tops, and those wobbles are not
+    extinction minima. Returns (angle_deg, value) sorted by angle.
+    """
+    spline, fitted = _fit_circle_spline(angles, values)
+    if spline is None:
+        return []
+
+    curve = spline(fitted)
+    midpoint = float(curve.min() + 0.5 * (curve.max() - curve.min()))
+
+    minima: Dict[float, float] = {}
+    for root in spline.derivative().roots(extrapolate=False):
+        if spline(root, 2) <= 0:            # second derivative <= 0: a maximum, not a dip
+            continue
+        value = float(spline(root))
+        if value > midpoint:
+            continue
+        if floor is not None:
+            value = max(value, floor)
+        minima[round(float(root) % 360.0, 1)] = value
+    return sorted(minima.items())
 
 
 def _polar_series(ax, angles: np.ndarray, mean: np.ndarray, std: np.ndarray,
@@ -1511,6 +1550,26 @@ def _draw_curve(ax, angles: np.ndarray, mean: np.ndarray, color: str, label: Opt
     dense_angles, dense_mean = curve
     ax.plot(to_x(dense_angles), dense_mean, color=color, linewidth=linewidth, label=label)
     ax.plot(to_x(angles), mean, color=color, marker="o", markersize=markersize, linestyle="none")
+
+
+def _mark_minima(ax, minima: Sequence[Tuple[float, float]], color: str = "0.2",
+                 to_x=None, annotate: bool = False, label: Optional[str] = None) -> None:
+    """Ring the interpolated minima, and on a linear panel write the angle of each."""
+    if not minima:
+        return
+    to_x = to_x if to_x is not None else (lambda degrees: degrees)
+    angles = np.array([angle for angle, _ in minima], dtype=float)
+    values = np.array([value for _, value in minima], dtype=float)
+    ax.plot(to_x(angles), values, linestyle="none", marker="o", markersize=7,
+            markerfacecolor="none", markeredgecolor=color, markeredgewidth=1.3,
+            label=label, zorder=5)
+    if not annotate:
+        return
+    for angle, value in minima:
+        ax.annotate(f"{angle:g}°", (angle, value), textcoords="offset points",
+                    xytext=(0, 11), ha="center", fontsize=6.5, color=color, zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
+                              edgecolor="none", alpha=0.75))
 
 
 def _polar_style(ax, title: str, clockwise: bool = True) -> None:
@@ -1608,6 +1667,10 @@ def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
     harmonics_vs_angle.png) plus the arms themselves as thin curves, so a lopsided pair
     of arms shows up without a figure of its own. The linear row is the same data read
     the other way: it separates lobes of similar radius that the polar panel overlaps.
+
+    The interpolation of SMOOTH_HARMONICS is applied to the sum only, and its minima are
+    ringed on both rows, labelled with their angle on the linear one, and written to
+    interpolated_minima.csv beside the figure.
     """
     harmonics = sorted(series["harmonics"])
     if not harmonics:
@@ -1618,6 +1681,7 @@ def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
     fig, polar_axes, linear_axes = _two_row_grid(
         len(harmonics), f"Intensity vs polarization angle — {series['power_label']}")
     circle_angles = _circle_arrays(series["angles"])[0]
+    minima_rows: List[Dict[str, Any]] = []
 
     for column, harmonic in enumerate(harmonics):
         total = series["harmonics"][harmonic]
@@ -1628,7 +1692,14 @@ def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
             for name, color in zip(arms_of[harmonic], ARM_COLORS):
                 arm = series["channels"][name]
                 draw(ax, series["angles"], arm["mean"], arm["std"], color, label=name,
-                     smooth=smooth, floor=0.0, alpha=0.12, linewidth=1.1, markersize=2.5)
+                     floor=0.0, alpha=0.12, linewidth=1.1, markersize=2.5)
+
+        if smooth:
+            minima = _harmonic_minima(series, harmonic)
+            _mark_minima(polar_axes[column], minima, to_x=np.deg2rad)
+            _mark_minima(linear_axes[column], minima, annotate=True,
+                         label="interpolated minimum")
+            minima_rows.extend(_minima_rows(series["power_label"], harmonic, total["mean"], minima))
 
         curves = [total["mean"]] + [series["channels"][name]["mean"] for name in arms_of[harmonic]]
         _focus_radial(polar_axes[column], curves, floor=0.0)
@@ -1639,6 +1710,29 @@ def plot_polarization_intensity(series: Dict[str, Any], save_dir: Path) -> None:
         linear_axes[column].legend(fontsize=7, loc="best", framealpha=0.8)
 
     _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
+    write_minima_csv(minima_rows, save_dir / POLARIZATION_MINIMA_CSV)
+
+
+def _harmonic_minima(series: Dict[str, Any], harmonic: str) -> List[Tuple[float, float]]:
+    """The interpolated minima of a harmonic's summed intensity, over the drawn circle."""
+    angles, mean = _circle_arrays(series["angles"], series["harmonics"][harmonic]["mean"])
+    return _curve_minima(angles, mean, floor=0.0)
+
+
+def _minima_rows(power_label: str, harmonic: str, mean: np.ndarray,
+                 minima: Sequence[Tuple[float, float]]) -> List[Dict[str, Any]]:
+    """One CSV row per minimum, with its depth relative to the brightest measured angle."""
+    peak = float(np.nanmax(mean)) if np.any(np.isfinite(mean)) else float("nan")
+    if minima:
+        print(f"  {harmonic} interpolated minima: "
+              + ", ".join(f"{angle:g}° ({value:.4g} counts/s)" for angle, value in minima))
+    return [{
+        "power_label": power_label,
+        "harmonic": harmonic,
+        "angle_deg": f"{angle:g}",
+        "value": f"{value:.6g}",
+        "fraction_of_max": f"{value / peak:.4g}" if peak else "",
+    } for angle, value in minima]
 
 
 def plot_polarization_g2(series: Dict[str, Any], save_dir: Path) -> None:
@@ -1702,8 +1796,11 @@ def plot_polarization_harmonics(series: Dict[str, Any], save_dir: Path) -> None:
 
     for column, harmonic in enumerate(harmonics):
         signal = series["harmonics"][harmonic]
+        smooth = harmonic in SMOOTH_HARMONICS
         _polar_series(axes[0, column], series["angles"], signal["mean"], signal["std"], "tab:blue",
-                      smooth=harmonic in SMOOTH_HARMONICS, floor=0.0)
+                      smooth=smooth, floor=0.0)
+        if smooth:
+            _mark_minima(axes[0, column], _harmonic_minima(series, harmonic), to_x=np.deg2rad)
         _focus_radial(axes[0, column], [signal["mean"]], floor=0.0)
         _polar_style(axes[0, column], f"{harmonic} intensity (counts/s)", series["clockwise"])
 
@@ -1729,7 +1826,9 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
     """Same four layouts, every power drawn on each panel as a coloured butterfly.
 
     The arm curves of the intensity figure are dropped here: with one colour per power
-    already on every panel, three more curves per harmonic would only be a thicket.
+    already on every panel, three more curves per harmonic would only be a thicket. The
+    interpolation of SMOOTH_HARMONICS is applied to each power's sum, so the overlay
+    carries one interpolated curve (and one set of minima) per power.
     """
     if len(series_by_power) < 2:
         return
@@ -1745,6 +1844,7 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
     if harmonics:
         fig, polar_axes, linear_axes = _two_row_grid(
             len(harmonics), f"Intensity vs polarization angle — {title_suffix}")
+        minima_rows: List[Dict[str, Any]] = []
         for column, harmonic in enumerate(harmonics):
             smooth = harmonic in SMOOTH_HARMONICS
             curves = []
@@ -1758,6 +1858,13 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
                                  (linear_axes[column], _linear_series)):
                     draw(ax, series["angles"], d["mean"], d["std"], colors[power],
                          label=power, alpha=0.18, smooth=smooth, floor=0.0)
+                if smooth:
+                    # Rings only, no angle labels: with one set of minima per power the
+                    # texts would land on each other. The angles are in the CSV.
+                    minima = _harmonic_minima(series, harmonic)
+                    _mark_minima(polar_axes[column], minima, color=colors[power], to_x=np.deg2rad)
+                    _mark_minima(linear_axes[column], minima, color=colors[power])
+                    minima_rows.extend(_minima_rows(power, harmonic, d["mean"], minima))
                 angles = _circle_arrays(series["angles"])[0]
                 if widest is None or angles[-1] - angles[0] > widest[-1] - widest[0]:
                     widest = angles
@@ -1770,6 +1877,7 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
                               "counts/s", widest)
         _power_legend(fig, colors)
         _save_polar_figure(fig, save_dir / "intensity_vs_angle.png")
+        write_minima_csv(minima_rows, save_dir / POLARIZATION_MINIMA_CSV)
 
     # --- g2: one row per harmonic, its auto pair then a cross family ---
     pair_names = sorted({pair for series in series_by_power.values() for pair in series["pairs"]})
@@ -1813,9 +1921,13 @@ def plot_polarization_overlay(series_by_power: Dict[str, Dict[str, Any]], save_d
                 if harmonic in series["harmonics"]:
                     d = series["harmonics"][harmonic]
                     curves.append(d["mean"])
+                    smooth = harmonic in SMOOTH_HARMONICS
                     _polar_series(axes[0, column], series["angles"], d["mean"], d["std"],
                                   colors[power], label=power, alpha=0.18,
-                                  smooth=harmonic in SMOOTH_HARMONICS, floor=0.0)
+                                  smooth=smooth, floor=0.0)
+                    if smooth:
+                        _mark_minima(axes[0, column], _harmonic_minima(series, harmonic),
+                                     color=colors[power], to_x=np.deg2rad)
             _focus_radial(axes[0, column], curves, floor=0.0)
             _polar_style(axes[0, column], f"{harmonic} intensity (counts/s)", clockwise)
 
@@ -1858,6 +1970,22 @@ def _overlay_panel(ax, series_by_power: Dict[str, Dict[str, Any]], key: str,
 # ----------------------------------------------------------------------------
 # The numbers behind the figures
 # ----------------------------------------------------------------------------
+
+def write_minima_csv(rows: Sequence[Dict[str, Any]], path: Path) -> Optional[Path]:
+    """The angle and depth of every interpolated minimum: the numbers behind the dips."""
+    if not rows:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["power_label", "harmonic", "angle_deg", "value", "fraction_of_max"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  {path.name}")
+    return path
+
 
 def write_polarization_csv(series: Dict[str, Any], path: Path) -> Path:
     rows = []
