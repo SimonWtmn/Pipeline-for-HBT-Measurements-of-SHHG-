@@ -1,0 +1,12 @@
+.HBTvenv/
+.HBTVenv/
+
+__pycache__/
+.DS_Store
+
+data/
+polarization_calibration/
+results/
+
+src/test.ipynb
+src/old/
