@@ -11,6 +11,7 @@ replays of any of them. See README section 3 for the field-by-field description.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -22,7 +23,7 @@ matplotlib.use("Agg")
 try:
     import hardware
     from experiment_config import ExperimentConfig, record_run, write_configuration
-    from hardware import RotationStage, RotationStageConfig
+    from hardware import ELLStageConfig, RotationStage, RotationStageConfig
     from pkl_json_analyze import (discover_ellipticity_powers, discover_laser_angle_powers,
                                   plot_ellipticity_campaign, plot_ellipticity_overlay,
                                   plot_ellipticity_power, plot_laser_angle_campaign,
@@ -31,12 +32,17 @@ try:
 except ImportError:
     from src import hardware
     from src.experiment_config import ExperimentConfig, record_run, write_configuration
-    from src.hardware import RotationStage, RotationStageConfig
+    from src.hardware import ELLStageConfig, RotationStage, RotationStageConfig
     from src.pkl_json_analyze import (discover_ellipticity_powers, discover_laser_angle_powers,
                                       plot_ellipticity_campaign, plot_ellipticity_overlay,
                                       plot_ellipticity_power, plot_laser_angle_campaign,
                                       plot_laser_angle_overlay, plot_laser_angle_summary,
                                       plot_stability, run_analysis)
+
+
+# Today, as the DATE folders are named (ddmmyyyy). Replace it by the literal string of
+# the folder to reprocess when replaying a run recorded on another day.
+TODAY = datetime.now().strftime("%d%m%Y")
 
 
 # ==========================================
@@ -47,7 +53,7 @@ CONFIG = ExperimentConfig(
     # ----------------- identity -----------------
     MATERIAL="CdTe110",
     EXPERIENCE_TYPE="Ellipticity_Scan_Xaxis",
-    DATE="31072026",
+    DATE=TODAY,
     POWER_LEVEL="30mW",
 
     # ----------------- optics / metadata -----------------
@@ -121,12 +127,19 @@ CONFIG = ExperimentConfig(
     # ELLIPTICITY_LASER_ANGLES=None,
     ELLIPTICITY_LASER_ANGLES=np.arange(100.0, 115.0, 2.0),    # the outer loop
     ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 4.0),   # the inner loop
+    # "polarizer" turns the polarizer itself on the Elliptec mount, with no HWP in the
+    # beam; "hwp" is the older setup, the Kinesis half-wave plate in front of the fixed
+    # vertical polarizer. Swap the two ELLIPTICITY_ANALYZER lines below with it.
+    ELLIPTICITY_ANALYZER_KIND="polarizer",
+    ELLIPTICITY_ANALYZER=ELLStageConfig(port="COM6",       # <- the Elliptec port
+                                        address="0", clockwise=True),
+    # ELLIPTICITY_ANALYZER_KIND="hwp",
+    # ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27264707", clockwise=True),
     ELLIPTICITY_ANALYZER_ENABLED=True,
-    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27264707", clockwise=True), #
     ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
     ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
-    ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # 90 deg for a half-wave plate, 180 def for a quarter-wave plate
-    ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata: 0 = vertical
+    ELLIPTICITY_FIT_PERIOD_DEG=None,        # None: 90 deg for the HWP, 180 for the polarizer
+    ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata, HWP setup only: 0 = vertical
     ELLIPTICITY_PLOT_POINTS=False,          # True to also analyse every single point
 
     # ----------------- analysis -----------------
@@ -337,7 +350,7 @@ def acquire_ellipticity_scan(cfg: ExperimentConfig) -> List[Run]:
         from src.acquisition import open_tagger
 
     power_points = cfg.pump_power_points()
-    log = hardware.EllipticityLog(cfg.ellipticity_log_path())
+    log = hardware.EllipticityLog(cfg.ellipticity_log_path(), cfg.ELLIPTICITY_ANALYZER_KIND)
     runs: List[Run] = []
     by_power: dict = {}
 
@@ -431,12 +444,18 @@ def open_pump(cfg: ExperimentConfig) -> hardware.PumpController:
 
 
 def open_analyzer(cfg: ExperimentConfig) -> hardware.AnalyzerController:
-    """The plate after the crystal, not connected yet: use it as a context manager."""
+    """The analyzer after the crystal, not connected yet: use as a context manager.
+
+    Whichever mount ELLIPTICITY_ANALYZER describes - a Kinesis controller turning the
+    half-wave plate, or an Elliptec one turning the polarizer itself - is picked from
+    the configuration's own type.
+    """
     dry_run = cfg.ELLIPTICITY_ANALYZER_DRY_RUN or not cfg.ELLIPTICITY_ANALYZER_ENABLED
     return hardware.AnalyzerController(
         cfg.ELLIPTICITY_ANALYZER or RotationStageConfig(),
         dry_run=dry_run,
         settle_time_s=cfg.ELLIPTICITY_ANALYZER_SETTLE_TIME_S,
+        element=cfg.ellipticity_analyzer_element,
     )
 
 
@@ -555,6 +574,8 @@ def print_summary(cfg: ExperimentConfig, runs: List[Run]) -> None:
     if cfg.is_ellipticity_scan():
         print(f"ell root: {cfg.ellipticity_root}")
         print(f"log     : {cfg.ellipticity_log_path().name}")
+        print(f"analyzer: {cfg.ellipticity_analyzer_note}, "
+              f"fit period {cfg.ELLIPTICITY_FIT_PERIOD_DEG:g} deg")
         if runs:
             planned = len(cfg.ellipticity_scan_points()) * len(cfg.pump_power_points())
             print(f"points  : {len(runs)}/{planned} recorded "

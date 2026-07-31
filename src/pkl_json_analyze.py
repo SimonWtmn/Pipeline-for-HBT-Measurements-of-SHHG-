@@ -1451,34 +1451,57 @@ def _linear_row_grid(n_cols: int, title: str, dpi: int = 300):
     return fig, list(axes[0])
 
 
+def _tiling_copies(span_deg: float) -> Optional[int]:
+    """How many copies of `span_deg` make a full turn, or None when it does not divide."""
+    if not (span_deg > 0):
+        return None
+    copies = 360.0 / span_deg
+    n = int(round(copies))
+    return n if n >= 2 and abs(copies - n) <= 1e-3 else None
+
+
 def _fill_polar_circle(angles: np.ndarray, *series: np.ndarray):
-    """Tile a partial scan by its own span so a polar plot covers the whole turn.
+    """Tile a partial scan by its own period so a polar plot covers the whole turn.
 
     Linear polarization repeats every 180 deg, so a 0-180 scan already samples every
     distinct state; copying that arc onto the empty half draws the familiar full
     butterfly instead of a bare semicircle. The same tiling completes a 0-90 scan
-    (four copies) or any arc whose span divides 360 evenly, while a genuine 0-360 scan
+    (four copies) or any arc whose period divides 360 evenly, while a genuine 0-360 scan
     is already full and is left untouched.
+
+    Two ways of writing the same sweep have to be told apart. `np.arange(0, 180, 15)`
+    stops at 165 and its period is the span it covers, one step included; the inclusive
+    `np.arange(0, 181, 4)` stops ON 180, so its period is the arc itself and its last
+    sample repeats the first at the seam. Copying the second as though it were the first
+    would tile by 184 deg, which divides nothing, and the sweep would stay a semicircle -
+    which is what happened to the ellipticity scans. So the open reading is tried first
+    (it is the usual one, and the only one for a scan that does not end on its own
+    period), and the inclusive reading is used when the open one does not tile; the
+    duplicated end point is then dropped so the seam is not drawn twice.
 
     A narrow zoom scan (a few close angles taken to resolve one minimum) is not a
     periodic unit of the pattern, so it is drawn as the measured arc rather than
-    replicated into a full circle: any span below MIN_TILE_SPAN_DEG is left as is.
+    replicated into a full circle: any period below MIN_TILE_SPAN_DEG is left as is.
     """
     angles = np.asarray(angles, dtype=float)
     if len(angles) < 2:
         return (angles, *series)
     step = float(np.median(np.diff(angles)))
-    span = angles[-1] - angles[0] + step
-    if not (step > 0) or span >= 359.9:
+    arc = angles[-1] - angles[0]
+    if not (step > 0) or arc + step >= 359.9:
         return (angles, *series)  # already (near) a full turn: nothing to copy
-    if span < MIN_TILE_SPAN_DEG:
+
+    inclusive = _tiling_copies(arc + step) is None
+    period = arc if inclusive else arc + step
+    unit = slice(0, -1) if inclusive else slice(None)
+    if period < MIN_TILE_SPAN_DEG:
         return (angles, *series)  # a zoom scan, not a period to tile: draw the arc as measured
-    copies = 360.0 / span
-    n = int(round(copies))
-    if n < 2 or abs(copies - n) > 1e-3:
-        return (angles, *series)  # span does not tile 360 cleanly: leave the arc as is
-    filled_angles = np.concatenate([angles + k * span for k in range(n)])
-    filled_series = [np.concatenate([np.asarray(s, dtype=float)] * n) for s in series]
+    n = _tiling_copies(period)
+    if n is None:
+        return (angles, *series)  # the arc does not tile 360 cleanly: leave it as is
+
+    filled_angles = np.concatenate([angles[unit] + k * period for k in range(n)])
+    filled_series = [np.concatenate([np.asarray(s, dtype=float)[unit]] * n) for s in series]
     return (filled_angles, *filled_series)
 
 
@@ -2175,14 +2198,19 @@ def write_angle_summary_csv(series: Dict[str, Any], path: Path) -> Path:
 # ELLIPTICITY SCAN: THE ANALYZER SWEEP RECORDED AT EACH LASER ANGLE
 # ============================================================================
 #
-# The harmonics leave the crystal, pass a half-wave plate, then a polarizer that never
-# moves. Turning the plate turns the polarization in front of that polarizer, so the
-# intensity it transmits follows Malus' law in the plate angle:
+# The harmonics leave the crystal and meet the analyzer, built one of two ways: a
+# half-wave plate followed by a polarizer that never moves (turning the plate turns the
+# polarization in front of that polarizer), or the polarizer alone, turned directly.
+# Either way the transmitted intensity follows Malus' law in the angle of whichever
+# element turns:
 #
 #     I(theta) = I0 cos^2(factor (theta - theta0)) + floor
 #
 # `factor` is 2 for a half-wave plate (a HWP turns the polarization by twice its own
-# angle, so the transmitted curve repeats every 90 deg) and 1 for a polarizer.
+# angle, so the transmitted curve repeats every 90 deg) and 1 for a polarizer (180 deg).
+# It comes from ELLIPTICITY_FIT_PERIOD_DEG, which ELLIPTICITY_ANALYZER_KIND sets; the
+# rest of the analysis is the same for both, and the figures are labelled with the kind
+# because the two are recorded under identical file names.
 #
 # What the shape says about the emission is entirely in how deep that curve goes:
 #
@@ -2413,9 +2441,17 @@ def fit_angle_series(series: Dict[str, Any], period_deg: float = 90.0) -> Dict[s
 
 def plot_ellipticity_power(cfg: ExperimentConfig,
                            power: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Every analyzer sweep of one power, its fit, and the summary versus laser angle."""
+    """Every analyzer sweep of one power, its fit, and the summary versus laser angle.
+
+    Every figure is labelled with which analyzer was on the bench: the two setups (a
+    half-wave plate in front of a fixed polarizer, or the polarizer turned directly)
+    give the same file names but sinusoids of different periods, so a figure has to say
+    which one it came from to be readable a month later.
+    """
     power = power or cfg.base_power
     period = float(cfg.ELLIPTICITY_FIT_PERIOD_DEG)
+    analyzer = cfg.ellipticity_analyzer_note
+    angle_name = cfg.ellipticity_angle_name
     laser_angles = _ellipticity_laser_angles(cfg, power)
     if not laser_angles:
         print(f"Ellipticity [{power}]: no laser angles configured.")
@@ -2425,9 +2461,9 @@ def plot_ellipticity_power(cfg: ExperimentConfig,
     fit_rows: List[Dict[str, Any]] = []
     for laser_angle in laser_angles:
         points = _ellipticity_points(cfg, power, laser_angle)
-        series = collect_angle_series(cfg, points, power_label=power,
-                                      angle_name="analyzer angle",
-                                      title=f"{power}, laser angle {laser_angle:g}°")
+        series = collect_angle_series(
+            cfg, points, power_label=power, angle_name=angle_name,
+            title=f"{power}, laser angle {laser_angle:g}° ({analyzer})")
         if len(series["angles"]) < 4:
             print(f"  [{power} @ {laser_angle:g}°] fewer than 4 analyzer angles with data, "
                   "sweep skipped.")
@@ -2457,16 +2493,16 @@ def plot_ellipticity_power(cfg: ExperimentConfig,
 
     summary_dir = cfg.ellipticity_summary_dir(power)
     summary_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n  ---- {power} summary ----")
-    plot_ellipticity_vs_laser_angle(sweeps, power, summary_dir)
-    plot_modulation_vs_laser_angle(sweeps, power, summary_dir)
+    print(f"\n  ---- {power} summary ({analyzer}) ----")
+    plot_ellipticity_vs_laser_angle(sweeps, power, summary_dir, analyzer)
+    plot_modulation_vs_laser_angle(sweeps, power, summary_dir, analyzer)
     for harmonic in sorted({h for sweep in sweeps for h in sweep["fits"]}):
-        plot_sinusoid_fits(sweeps, harmonic, power, summary_dir)
+        plot_sinusoid_fits(sweeps, harmonic, power, summary_dir, analyzer, angle_name)
     write_ellipticity_csv(sweeps, power, summary_dir / ELLIPTICITY_SUMMARY_CSV)
     write_sinusoid_csv(fit_rows, summary_dir / ELLIPTICITY_FIT_CSV)
 
     print(f"Ellipticity [{power}]: {len(sweeps)} laser angle(s) -> {summary_dir.parent}")
-    return {"power_label": power, "sweeps": sweeps}
+    return {"power_label": power, "sweeps": sweeps, "analyzer": analyzer}
 
 
 def plot_ellipticity_campaign(cfg: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
@@ -2524,25 +2560,36 @@ def _ellipticity_points(cfg: ExperimentConfig, power: str,
 # ----------------------------------------------------------------------------
 
 def plot_ellipticity_vs_laser_angle(sweeps: Sequence[Dict[str, Any]], power: str,
-                                    save_dir: Path) -> None:
+                                    save_dir: Path, analyzer: str = "") -> None:
     """The point of the scan: how elliptical the emission is at each pump angle."""
     _plot_fit_quantity(sweeps, power, save_dir / "ellipticity_vs_laser_angle.png",
                        key="ellipticity",
-                       title=f"Ellipticity of the harmonics vs laser angle — {power}",
+                       title=f"Ellipticity of the harmonics vs laser angle — "
+                             f"{_analyzer_suffix(power, analyzer)}",
                        ylabel="ellipticity  $\\epsilon = \\sqrt{I_{min}/I_{max}}$",
                        limits=(0.0, 1.05),
                        guides=((0.0, "linear"), (1.0, "circular")))
 
 
 def plot_modulation_vs_laser_angle(sweeps: Sequence[Dict[str, Any]], power: str,
-                                   save_dir: Path) -> None:
+                                   save_dir: Path, analyzer: str = "") -> None:
     """The depth of each fitted sinusoid: the number the ellipticity is derived from."""
     _plot_fit_quantity(sweeps, power, save_dir / "modulation_vs_laser_angle.png",
                        key="modulation",
-                       title=f"Modulation of the analyzer sweep vs laser angle — {power}",
+                       title=f"Modulation of the analyzer sweep vs laser angle — "
+                             f"{_analyzer_suffix(power, analyzer)}",
                        ylabel="modulation  $m = A / I_0$",
                        limits=(0.0, 1.05),
                        guides=((1.0, "linear"), (0.0, "circular")))
+
+
+def _analyzer_suffix(power: str, analyzer: str) -> str:
+    """"30mW (rotating polarizer)": what a summary figure is titled with.
+
+    Naming the analyzer on the figure is the only way to read it later: the sweeps of
+    the two setups are recorded under identical file names.
+    """
+    return f"{power} ({analyzer})" if analyzer else power
 
 
 def _plot_fit_quantity(sweeps: Sequence[Dict[str, Any]], power: str, path: Path, key: str,
@@ -2596,7 +2643,8 @@ def _plot_fit_quantity(sweeps: Sequence[Dict[str, Any]], power: str, path: Path,
 
 
 def plot_sinusoid_fits(sweeps: Sequence[Dict[str, Any]], harmonic: str, power: str,
-                       save_dir: Path) -> None:
+                       save_dir: Path, analyzer: str = "",
+                       angle_name: str = "analyzer angle") -> None:
     """Every analyzer sweep of one harmonic and its fit, side by side.
 
     The figure the ellipticity has to be read against: a curve grazing zero is linear,
@@ -2610,7 +2658,8 @@ def plot_sinusoid_fits(sweeps: Sequence[Dict[str, Any]], harmonic: str, power: s
     rows = int(np.ceil(len(usable) / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(4.0 * cols, 3.2 * rows), dpi=300,
                              squeeze=False)
-    fig.suptitle(f"{harmonic}: analyzer sweep and its sinusoidal fit — {power}",
+    fig.suptitle(f"{harmonic}: analyzer sweep and its sinusoidal fit — "
+                 f"{_analyzer_suffix(power, analyzer)}",
                  fontsize=13, fontweight="bold")
 
     for index, sweep in enumerate(usable):
@@ -2624,7 +2673,7 @@ def plot_sinusoid_fits(sweeps: Sequence[Dict[str, Any]], harmonic: str, power: s
         _draw_sinusoid(ax, fit, angles)
         ax.set_title(f"laser angle {sweep['laser_angle_deg']:g}°", fontsize=10,
                      fontweight="bold")
-        ax.set_xlabel("analyzer angle (deg)", fontsize=8)
+        ax.set_xlabel(f"{angle_name} (deg)", fontsize=8)
         ax.set_ylabel("counts/s", fontsize=8)
         ax.set_ylim(0.0, None)
         ax.grid(True, alpha=0.35)
@@ -2649,6 +2698,10 @@ def plot_ellipticity_overlay(by_power: Dict[str, Dict[str, Any]], save_dir: Path
     save_dir.mkdir(parents=True, exist_ok=True)
     colors = _power_colors(list(by_power))
     markers = ("o", "s", "^", "D", "v")
+    # Normally one analyzer for the whole folder; both are named when a folder somehow
+    # holds sweeps of each, since their sinusoids do not have the same period.
+    analyzers = ", ".join(sorted({campaign.get("analyzer", "") for campaign in by_power.values()}
+                                 - {""}))
 
     for key, ylabel, name in (
             ("ellipticity", "ellipticity  $\\epsilon = \\sqrt{I_{min}/I_{max}}$",
@@ -2657,7 +2710,8 @@ def plot_ellipticity_overlay(by_power: Dict[str, Dict[str, Any]], save_dir: Path
         harmonics = sorted({harmonic for campaign in by_power.values()
                             for sweep in campaign["sweeps"] for harmonic in sweep["fits"]})
         fig, ax = plt.subplots(figsize=(7.6, 5.0), dpi=300)
-        fig.suptitle(f"{key.capitalize()} vs laser angle — {', '.join(by_power)}",
+        fig.suptitle(f"{key.capitalize()} vs laser angle — "
+                     f"{_analyzer_suffix(', '.join(by_power), analyzers)}",
                      fontsize=13, fontweight="bold")
         for power, campaign in by_power.items():
             for index, harmonic in enumerate(harmonics):

@@ -19,12 +19,34 @@ import numpy as np
 
 try:
     from hardware import (ELLIPTICITY_LOG_NAME, SCAN_LOG_NAME, RotationStageConfig,
-                          wrap_360)
+                          StageConfig, describe_stage, stage_is_addressed, wrap_360)
 except ImportError:  # pragma: no cover - import style depends on the entry point
     from src.hardware import (ELLIPTICITY_LOG_NAME, SCAN_LOG_NAME, RotationStageConfig,
-                              wrap_360)
+                              StageConfig, describe_stage, stage_is_addressed, wrap_360)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The two ways of building the analyzer of an ellipticity scan. They are the same
+# measurement - one mount turning in the harmonic beam, the shape of the transmitted
+# intensity - and differ only in what is on the mount, and therefore in how often the
+# transmitted curve repeats: a half-wave plate turns the polarization by twice its own
+# angle, so its Malus curve comes round every 90 deg, while a polarizer turned directly
+# gives the usual 180 deg. Everything else (the file names, the fits, the figures) is
+# shared, so the kind is carried as metadata and named on the figures.
+ANALYZER_KINDS: Dict[str, Dict[str, Any]] = {
+    "hwp": {
+        "element": "half-wave plate",
+        "angle_name": "HWP angle",
+        "note": "HWP + fixed polarizer",
+        "period_deg": 90.0,
+    },
+    "polarizer": {
+        "element": "polarizer",
+        "angle_name": "polarizer angle",
+        "note": "rotating polarizer",
+        "period_deg": 180.0,
+    },
+}
 
 
 # ============================================================================
@@ -135,24 +157,30 @@ class ExperimentConfig:
     LASER_ANGLE_PLOT_ANGLES: bool = False
 
     # ---------- Ellipticity scan (optional) ----------
-    # The polarization of the HARMONICS, measured AFTER the crystal: a half-wave plate
-    # in front of a fixed polarizer is rotated at each pump angle, and the modulation of
-    # the intensity it transmits says how elliptical the emission is (a flat curve is
-    # circular, one reaching zero is linear).
+    # The polarization of the HARMONICS, measured AFTER the crystal: one mount is turned
+    # at each pump angle, and the modulation of the intensity it transmits says how
+    # elliptical the emission is (a flat curve is circular, one reaching zero is linear).
     #   ELLIPTICITY_LASER_ANGLES = [0.0, 45.0, 90.0]        # the outer loop
     #   ELLIPTICITY_ANALYZER_ANGLES = np.arange(0.0, 180.0, 15.0)   # the inner loop
     ELLIPTICITY_LASER_ANGLES: Optional[Sequence[float]] = None
     ELLIPTICITY_ANALYZER_ANGLES: Sequence[float] = field(
         default_factory=lambda: np.arange(0.0, 180.0, 15.0))
-    ELLIPTICITY_ANALYZER: Optional[RotationStageConfig] = None
+    # What is on that mount, one of ANALYZER_KINDS: "hwp" turns a half-wave plate in
+    # front of a fixed polarizer, "polarizer" turns the polarizer itself with no plate
+    # at all. It sets the period of the fitted curve, names the swept angle on every
+    # figure, and is written to experiment_config.txt and the scan log.
+    ELLIPTICITY_ANALYZER_KIND: str = "hwp"
+    # RotationStageConfig for a Kinesis mount, ELLStageConfig for an Elliptec one.
+    ELLIPTICITY_ANALYZER: Optional[StageConfig] = None
     ELLIPTICITY_ANALYZER_ENABLED: bool = False
     ELLIPTICITY_ANALYZER_DRY_RUN: bool = False
     ELLIPTICITY_ANALYZER_SETTLE_TIME_S: float = 0.2
-    # A half-wave plate turns the polarization by twice its own angle, so what the fixed
-    # polarizer transmits repeats every 90 deg of plate angle. That is the period of the
-    # fitted Malus curve; change it only if the analyzer is not a HWP.
-    ELLIPTICITY_FIT_PERIOD_DEG: float = 90.0
-    #: Metadata only: the angle of the fixed polarizer after the plate (0 = vertical).
+    # The period of the fitted Malus curve. None takes it from ELLIPTICITY_ANALYZER_KIND
+    # (90 deg for the half-wave plate, 180 deg for the polarizer), which is what it
+    # should be: it is a property of the optic, not a fitting preference.
+    ELLIPTICITY_FIT_PERIOD_DEG: Optional[float] = None
+    #: Metadata only, and only with the HWP: the fixed polarizer after the plate
+    #: (0 = vertical). With "polarizer" the swept mount IS the polarizer.
     ELLIPTICITY_FIXED_POLARIZER_DEG: float = 0.0
     ANALYZER_ANGLE_DEG: Optional[float] = None  # analyzer angle of THIS run
     # Per-point HBT trees (results/.../ellipticity/{power}/{laser angle}/points/) are
@@ -251,6 +279,7 @@ class ExperimentConfig:
         self._validate_pump_stages("LASER_ANGLE_SCAN")
 
     def _validate_ellipticity_scan(self) -> None:
+        self._resolve_analyzer_kind()
         if self.ELLIPTICITY_LASER_ANGLES is None:
             return
 
@@ -294,17 +323,34 @@ class ExperimentConfig:
         if not self.ELLIPTICITY_ANALYZER_ENABLED:
             raise ValueError(
                 "An ellipticity scan is configured but ELLIPTICITY_ANALYZER_ENABLED is "
-                "False: every analyzer angle would be recorded with the plate standing "
-                "still, so the sinusoid would be flat for want of motion rather than "
-                "because the emission is circular. Enable the analyzer mount, or set "
+                f"False: every analyzer angle would be recorded with the "
+                f"{self.ellipticity_analyzer_element} standing still, so the sinusoid "
+                "would be flat for want of motion rather than because the emission is "
+                "circular. Enable the analyzer mount, or set "
                 "ELLIPTICITY_ANALYZER_DRY_RUN=True to rehearse."
             )
-        if self.ELLIPTICITY_ANALYZER is None or not self.ELLIPTICITY_ANALYZER.serial_number:
+        if not stage_is_addressed(self.ELLIPTICITY_ANALYZER):
             raise ValueError(
-                "ELLIPTICITY_ANALYZER_ENABLED is True but ELLIPTICITY_ANALYZER has no "
-                "serial number: pass "
-                "ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number=\"...\")."
+                "ELLIPTICITY_ANALYZER_ENABLED is True but ELLIPTICITY_ANALYZER does not "
+                "name a mount: pass "
+                "ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number=\"...\") for a "
+                "Kinesis controller, or ELLIPTICITY_ANALYZER=ELLStageConfig(port=\"...\") "
+                "for an Elliptec one."
             )
+
+    def _resolve_analyzer_kind(self) -> None:
+        """Normalise the analyzer kind, and take the fit period from it when unset."""
+        kind = str(self.ELLIPTICITY_ANALYZER_KIND or "hwp").strip().lower()
+        if kind not in ANALYZER_KINDS:
+            raise ValueError(
+                f"ELLIPTICITY_ANALYZER_KIND must be one of {sorted(ANALYZER_KINDS)} "
+                f"(\"hwp\" turns a half-wave plate in front of a fixed polarizer, "
+                f"\"polarizer\" turns the polarizer itself), got "
+                f"{self.ELLIPTICITY_ANALYZER_KIND!r}"
+            )
+        self.ELLIPTICITY_ANALYZER_KIND = kind
+        if self.ELLIPTICITY_FIT_PERIOD_DEG is None:
+            self.ELLIPTICITY_FIT_PERIOD_DEG = float(ANALYZER_KINDS[kind]["period_deg"])
 
     def _validate_pump_power(self, scan_field: str) -> None:
         if self.PUMP_POWER_SCAN:
@@ -543,6 +589,25 @@ class ExperimentConfig:
     def is_ellipticity_scan(self) -> bool:
         return self.ELLIPTICITY_LASER_ANGLES is not None
 
+    @property
+    def _analyzer_kind(self) -> Dict[str, Any]:
+        return ANALYZER_KINDS[str(self.ELLIPTICITY_ANALYZER_KIND).strip().lower()]
+
+    @property
+    def ellipticity_analyzer_element(self) -> str:
+        """What is on the analyzer mount: "half-wave plate" or "polarizer"."""
+        return str(self._analyzer_kind["element"])
+
+    @property
+    def ellipticity_angle_name(self) -> str:
+        """How the swept angle is named on the figures: "HWP angle", "polarizer angle"."""
+        return str(self._analyzer_kind["angle_name"])
+
+    @property
+    def ellipticity_analyzer_note(self) -> str:
+        """The short line the figures carry so a sweep says how it was measured."""
+        return str(self._analyzer_kind["note"])
+
     def ellipticity_laser_angles(self) -> List[float]:
         return [float(angle) for angle in (self.ELLIPTICITY_LASER_ANGLES or [])]
 
@@ -612,6 +677,7 @@ class ExperimentConfig:
             params["requested_power"] = self.PUMP_POWER
         if self.ANALYZER_ANGLE_DEG is not None:
             params["analyzer_angle_deg"] = self.ANALYZER_ANGLE_DEG
+            params["analyzer_kind"] = self.ELLIPTICITY_ANALYZER_KIND
         return params
 
 
@@ -717,10 +783,9 @@ def _shared_sections(cfg: ExperimentConfig) -> Dict[str, Section]:
 
 def _power_scan_section(cfg: ExperimentConfig) -> Section:
     """The planned scan: which power label was recorded at which stage angle."""
-    stage = cfg.ROTATION_STAGE
     return {
         "enabled": _yes_no(True),
-        "stage_serial": (stage.serial_number if stage else "") or "(none)",
+        "stage_serial": describe_stage(cfg.ROTATION_STAGE),
         "stage_motion": _stage_motion(cfg),
         "stop_on_error": _yes_no(cfg.POWER_SCAN_STOP_ON_ERROR),
         "points": ", ".join(f"{power} @ {angle:g} deg" for power, angle in cfg.power_scan_points()),
@@ -743,22 +808,29 @@ def _laser_angle_scan_section(cfg: ExperimentConfig) -> Section:
 
 
 def _ellipticity_scan_section(cfg: ExperimentConfig) -> Section:
-    """The planned ellipticity scan: the pump angles, and the analyzer sweep at each."""
-    analyzer = cfg.ELLIPTICITY_ANALYZER
+    """The planned ellipticity scan: the pump angles, and the analyzer sweep at each.
+
+    `analyzer_kind` is the one line that says which of the two setups was on the bench,
+    since the file names of the two are identical.
+    """
     section: Section = {
         "enabled": _yes_no(True),
         "power_label": cfg.POWER_LEVEL,
         "requested_power": f"{cfg.PUMP_POWER:g} (calibration unit)",
         "laser_angles_deg": _angles(cfg.ellipticity_laser_angles()),
+        "analyzer_kind": f"{cfg.ELLIPTICITY_ANALYZER_KIND} ({cfg.ellipticity_analyzer_note})",
         "analyzer_angles_deg": _angles(cfg.ELLIPTICITY_ANALYZER_ANGLES),
-        "analyzer_serial": (analyzer.serial_number if analyzer else "") or "(none)",
+        "analyzer_stage": describe_stage(cfg.ELLIPTICITY_ANALYZER),
         "analyzer_motion": _motion(cfg.ELLIPTICITY_ANALYZER_ENABLED,
                                    cfg.ELLIPTICITY_ANALYZER_DRY_RUN,
                                    "no (analyzer not turned)"),
-        "fixed_polarizer_deg": f"{cfg.ELLIPTICITY_FIXED_POLARIZER_DEG:g} (0 = vertical)",
         "fit_period_deg": f"{cfg.ELLIPTICITY_FIT_PERIOD_DEG:g}",
         "per_angle_log": cfg.ellipticity_log_path().name,
     }
+    if cfg.ELLIPTICITY_ANALYZER_KIND == "hwp":
+        # With the polarizer on the mount there is no second, fixed one to describe.
+        section["fixed_polarizer_deg"] = (
+            f"{cfg.ELLIPTICITY_FIXED_POLARIZER_DEG:g} (0 = vertical)")
     section.update(_pump_section(cfg))
     return section
 
@@ -768,8 +840,8 @@ def _pump_section(cfg: ExperimentConfig) -> Section:
     section: Section = {
         "pump_motion": _motion(cfg.PUMP_STAGE_ENABLED, cfg.PUMP_STAGE_DRY_RUN,
                                "no (polarization not set)"),
-        "pump_p1_serial": (cfg.PUMP_P1.serial_number if cfg.PUMP_P1 else "") or "(none)",
-        "pump_hwp_serial": (cfg.PUMP_HWP.serial_number if cfg.PUMP_HWP else "") or "(none)",
+        "pump_p1_serial": describe_stage(cfg.PUMP_P1),
+        "pump_hwp_serial": describe_stage(cfg.PUMP_HWP),
     }
     if cfg.PUMP_CALIBRATION is not None:
         section["pump_calibration"] = str(cfg.PUMP_CALIBRATION)
@@ -798,6 +870,7 @@ def _run_section(cfg: ExperimentConfig, result: Any, previous: Section,
         section["laser_angle_deg"] = f"{cfg.LASER_ANGLE_DEG:g}"
     if cfg.ANALYZER_ANGLE_DEG is not None:
         section["analyzer_angle_deg"] = f"{cfg.ANALYZER_ANGLE_DEG:g}"
+        section["analyzer_kind"] = cfg.ELLIPTICITY_ANALYZER_KIND
     if status != "running":
         section["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return section
@@ -986,7 +1059,13 @@ def laser_angle_tag(angle_deg: float) -> str:
 
 
 def analyzer_angle_tag(angle_deg: float) -> str:
-    """The analyzer plate angle after the crystal: 15 -> "hwp015p0"."""
+    """The analyzer angle after the crystal: 15 -> "hwp015p0".
+
+    The "hwp" prefix is historical and names the analyzer angle whichever optic carries
+    it, so a scan turning the polarizer itself writes the same file names: the two are
+    told apart by `analyzer_kind` in `experiment_config.txt` and in the scan log, not by
+    the file names. Keeping one prefix is what lets both be found by the same glob.
+    """
     return angle_tag(angle_deg, "hwp")
 
 

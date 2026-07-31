@@ -95,7 +95,7 @@ file :
 | Module | Part 1 | Part 2 | Part 3 |
 | --- | --- | --- | --- |
 | `experiment_config.py` | the `ExperimentConfig` dataclass | writing `experiment_config.txt` | naming helpers |
-| `hardware.py` | one Thorlabs rotation mount | the pump's polarization from the lookup table | the analyzer after the crystal, and the two scan logs |
+| `hardware.py` | one Thorlabs rotation mount, Kinesis or Elliptec | the pump's polarization from the lookup table | the analyzer after the crystal, and the two scan logs |
 | `acquisition.py` | the live acquisition | the on-disk schema (`build_payload`) | – |
 | `pkl_json_analyze.py` | the per-power analysis and figures | g²(0) and R versus time | the vs-angle summaries, then the ellipticity fits |
 
@@ -155,7 +155,7 @@ The two angle scans turn different plates and answer different questions:
 
 | | **Laser angle scan** (§3.6) | **Ellipticity scan** (§3.7) |
 | --- | --- | --- |
-| what turns | P1 + HWP **before** the crystal | a HWP **after** the crystal, in front of a fixed polarizer |
+| what turns | P1 + HWP **before** the crystal | the analyzer **after** the crystal: a HWP in front of a fixed polarizer, or the polarizer itself |
 | what is asked | how the emission depends on the direction the crystal is driven along | how elliptical the emission itself is |
 | one acquisition per | pump angle | (pump angle, analyzer angle) pair |
 | the answer | intensity / g²(0) / R versus pump angle | ellipticity versus pump angle |
@@ -231,6 +231,8 @@ Like the Time Tagger, the import is lazy — inside `RotationStage.connect()` �
 The controller family is guessed from the first two digits of the serial number: `55…` is a K10CR1 cage rotator, `27…` a KDC101 K-cube (a PRM1Z8 mount, typically), `83…` a TDC001, `26…` a KST101, `40…` a benchtop stepper. Set `device_type="K10CR1"` to override the guess, or add an entry to `DEVICE_CLASSES` for a controller that is not listed — the .NET class name and its assembly are all that is needed.
 
 Angles are **degrees, absolute, in the controller's own coordinate system**: they mean whatever the last homing made them mean. Home once with `home_on_connect=True` (or from the Kinesis GUI) before calibrating the (power, angle) pairs, and do not home again in the middle of a campaign.
+
+One mount in the setup is not a Kinesis device at all — the Elliptec the polarizer sits on, which speaks a serial protocol and needs **pyserial** instead of pythonnet (`pip install pyserial`, §4.6b). The same lazy-import rule applies: nothing is imported until something connects.
 
 **No hardware?** `ROTATION_STAGE_DRY_RUN=True` prints each move and skips every import, which is how a scan is rehearsed on a laptop:
 
@@ -337,16 +339,25 @@ The full result tree is in §6.5.
 
 ### 3.7 Ellipticity scan
 
-The laser angle scan asks what the crystal emits; this one asks **how that emission is polarized**. A half-wave plate is added *after* the crystal, in front of a polarizer that never moves. Turning the plate by θ turns the harmonic polarization by 2θ, so what the polarizer transmits traces a sinusoid of period **90°** in plate angle, and the depth of that sinusoid is the whole measurement:
+The laser angle scan asks what the crystal emits; this one asks **how that emission is polarized**. An analyzer is added *after* the crystal and turned through a sweep, and the depth of the sinusoid it traces is the whole measurement:
 
 * a curve that reaches **zero** — one axis of the ellipse carries nothing — is a **linear** polarization;
 * a **flat** curve — both axes carry the same — is a **circular** one.
 
-The curve is Malus' law in the plate angle,
+There are **two ways to build that analyzer**, and `ELLIPTICITY_ANALYZER_KIND` says which one is on the bench:
+
+| `ELLIPTICITY_ANALYZER_KIND` | What is in the beam | Curve repeats every | Typical mount |
+| --- | --- | --- | --- |
+| `"hwp"` | a half-wave plate turning in front of a polarizer that never moves — the plate turns the polarization by 2θ | **90°** | Kinesis, `RotationStageConfig` |
+| `"polarizer"` | the polarizer itself, turned directly, with no plate in the beam at all | **180°** | Elliptec, `ELLStageConfig` |
+
+Everything else is identical — the same nested loops, the same file names, the same fits, the same figures — so the two are interchangeable and comparable. Only the period of the fitted curve differs, and `ELLIPTICITY_FIT_PERIOD_DEG=None` takes it from the kind. Because the two are indistinguishable in the file names, the kind is written to `experiment_config.txt` and to `ellipticity_scan.csv`, and **named on every ellipticity figure** ("Intensity vs polarizer angle — 30mW, laser angle 100° (rotating polarizer)").
+
+The curve is Malus' law in the angle of whichever element turns,
 
 $$
 I(\theta) = I_0 \cos^2\!\big(f\,(\theta - \theta_0)\big) + \text{floor},
-\qquad f = 2 \text{ for a HWP},
+\qquad f = 2 \text{ for a HWP},\; 1 \text{ for a polarizer},
 $$
 
 and its floor **is** the smaller axis of the ellipse while its crest is the larger one. So with $I_{max} = I_0 + \text{floor}$ and $I_{min} = \text{floor}$ (clipped at zero),
@@ -373,15 +384,24 @@ CONFIG = ExperimentConfig(
     PUMP_HWP=RotationStageConfig(serial_number="27270567", clockwise=True),
 
     ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],                 # the outer loop
-    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),    # the inner loop
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 15.0),    # the inner loop
     ELLIPTICITY_ANALYZER_ENABLED=True,
-    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
+
+    # the polarizer itself, on its Elliptec mount (no HWP in the beam)
+    ELLIPTICITY_ANALYZER_KIND="polarizer",
+    ELLIPTICITY_ANALYZER=ELLStageConfig(port="COM6", address="0", clockwise=True),
+
+    # …or the half-wave plate in front of the fixed polarizer, on Kinesis
+    # ELLIPTICITY_ANALYZER_KIND="hwp",
+    # ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27270568", clockwise=True),
 
     RUN_ANALYSIS_AFTER_ACQUIRE=True,
 )
 ```
 
-Three mounts, then: the two pump mounts of §3.6 — the pump polarization is set exactly the same way, from the same lookup table, and unreachable pump angles are skipped by the same preflight — plus the analyzer plate. **The analyzer needs no calibration**: its angle *is* the requested angle, because the measurement is the shape of the transmitted curve, not its absolute level.
+Three mounts, then: the two pump mounts of §3.6 — the pump polarization is set exactly the same way, from the same lookup table, and unreachable pump angles are skipped by the same preflight — plus the analyzer. **The analyzer needs no calibration**: its angle *is* the requested angle, because the measurement is the shape of the transmitted curve, not its absolute level.
+
+**The Elliptec mount** (§4.6b) speaks a short serial protocol instead of Kinesis, so it is addressed by the port it enumerated as rather than by a controller serial number. `ELLStageConfig` is what selects that driver; nothing else in the scan changes, and `ELLIPTICITY_ANALYZER_DRY_RUN=True` rehearses it exactly as it rehearses a Kinesis mount.
 
 **What one command then does.** The loops are nested power → laser angle → analyzer angle, and the pump is set once per laser angle while the analyzer turns through its whole sweep there. That is both the quickest order (the pump mounts move three times, the analyzer thirty-six) and the one that keeps a sweep internally consistent: every point of a fit was taken at the same pump setting.
 
@@ -390,14 +410,16 @@ Three mounts, then: the two pump mounts of §3.6 — the pump polarization is se
 [pump] 45 deg: P1 45 deg, HWP 24.8112 deg for 50 mW
 
 ===== analyzer 1/12: 0 deg (50mW_las045p0_hwp000p0) =====
-[analyzer] plate to 0 deg
+[analyzer] polarizer to 0 deg
   chunk 1/4 -> 50mW_las045p0_hwp000p0_num1.pkl
   …
 ```
 
-**How the files are named.** Each point carries both angles: `50mW_las045p0_hwp000p0`, `50mW_las045p0_hwp015p0`, … Same fixed-width rule as §3.6, and the `hwp` half is what distinguishes an ellipticity point from a laser angle scan's `50mW_las045p0` — so both scans can share a `DATE` folder without their files being confused for one another.
+**How the files are named.** Each point carries both angles: `50mW_las045p0_hwp000p0`, `50mW_las045p0_hwp015p0`, … Same fixed-width rule as §3.6, and the `hwp` half is what distinguishes an ellipticity point from a laser angle scan's `50mW_las045p0` — so both scans can share a `DATE` folder without their files being confused for one another. That `hwp` prefix names the **analyzer angle** whichever element carries it: a polarizer sweep writes the same names, and the two are told apart by `analyzer_kind` in the metadata, not by the file names. One prefix is what lets both be found by the same glob.
 
-**Per sweep**, under `results/…/ellipticity/{POWER}/las045p0/`, you get the same four vs-angle figures as a laser angle scan, drawn against **analyzer** angle, with the fitted curve overlaid on the intensity panels and `sinusoidal_fit.csv` holding every fitted parameter (per harmonic, and per channel as a cross-check). `intensity_vs_angle.png` is the one to read: the depth of the curve there *is* the ellipticity, so that figure is one large linear panel per harmonic — the polar butterfly of the same curves sits in the corner as a thumbnail, and full size in `harmonics_vs_angle.png`.
+**Per sweep**, under `results/…/ellipticity/{POWER}/las045p0/`, you get the same four vs-angle figures as a laser angle scan, drawn against **analyzer** angle (labelled "HWP angle" or "polarizer angle" after the kind), with the fitted curve overlaid on the intensity panels and `sinusoidal_fit.csv` holding every fitted parameter (per harmonic, and per channel as a cross-check). `intensity_vs_angle.png` is the one to read: the depth of the curve there *is* the ellipticity, so that figure is one large linear panel per harmonic — the polar butterfly of the same curves sits in the corner as a thumbnail, and full size in `harmonics_vs_angle.png`.
+
+**A sweep that covers half the circle is drawn over the whole of it.** A polarization state repeats every 180°, so a 0–180° sweep has already measured every distinct state and the missing half is a copy of the measured one: the polar panels mirror it rather than draw a bare semicircle, and the linear panels run to 360° for the same reason. Both ways of writing that sweep are recognised — `np.arange(0, 180, 15)`, which stops at 165°, and the inclusive `np.arange(0, 181, 4)`, which stops on 180° and whose last point repeats the first (it is dropped at the seam rather than drawn twice). The same rule completes a 0–90° sweep with four copies, or any arc whose period divides 360° evenly. A narrow zoom scan (a few close angles taken to resolve one minimum, anything under 45° of arc) is not a period of the pattern, so it is left exactly as measured.
 
 **Per power**, under `results/…/ellipticity/{POWER}/summary/`:
 
@@ -561,7 +583,7 @@ Choose the interval so that `ACQUISITION_DURATION_S / interval` is comfortably l
 
 `ROTATION_ANGLE_DEG` is normally set by the scan loop, one step at a time, and ends up in the run's section and in each data file's `Parameters`. Setting it by hand together with `ROTATION_STAGE_ENABLED=True` and no `POWER_SCAN` is the single-point case: move once, then record one power level.
 
-`RotationStageConfig` (in `src/hardware.py`) describes the mount itself, and the same dataclass is used for the two pump mounts and for the analyzer plate of the angle scans:
+`RotationStageConfig` (in `src/hardware.py`) describes a **Kinesis** mount, and the same dataclass is used for the two pump mounts and for the analyzer of the angle scans (an Elliptec analyzer uses `ELLStageConfig` instead, §4.6b):
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -582,6 +604,29 @@ Choose the interval so that `ACQUISITION_DURATION_S / interval` is comfortably l
 A move is commanded and then **polled**: `move_to_angle_deg` returns once the position is within `angle_tolerance_deg` of the target, waits `settle_time_s` for the mount to stop ringing, and raises `TimeoutError` after `move_timeout_s`. Tolerance and settling time therefore define "arrived", not the controller's own idea of a finished move — a mount that hunts around its target still satisfies it.
 
 `clockwise` must match the mount the calibration was taken on: with `False`, 15° is sent to the controller as 345°. Angles are wrapped into `[0, 360)` and compared the short way round, so a move from 359° to 1° arrives instead of timing out at the seam.
+
+### 4.6b An Elliptec mount instead: `ELLStageConfig`
+
+The Thorlabs Elliptec mounts (ELL14, ELL18, …) are not Kinesis devices: they answer a short ASCII protocol on a **virtual COM port** rather than a .NET API, so they need their own driver — `ELLStage`, in the same file — rather than another entry in the Kinesis device table. It offers the same handful of methods under the same names, so anything that turns a mount takes either kind, and `make_stage()` picks the driver from the type of the configuration alone.
+
+That driver needs **pyserial** (`pip install pyserial`), imported only when something actually connects, exactly as `pythonnet` is for Kinesis: a laptop with neither still runs every dry run, analysis and replot.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `port` | `""` | what the mount enumerated as: `"COM5"`, `"/dev/tty.usbserial-…"`, `"/dev/ttyUSB0"`; required to move |
+| `address` | `"0"` | the bus address set in the Elliptec software; `'0'` unless several mounts share one interface board |
+| `baudrate` | `9600` | the Elliptec default |
+| `clockwise` | `True` | as above: `False` negates every requested angle |
+| `home_on_connect` | `False` | home before the first move |
+| `home_clockwise` | `True` | which way homing turns |
+| `counts_per_degree` | `None` | read from the mount's own `in` reply (398.222 for an ELL14); set it only for a mount that reports its pulses per revolution wrongly |
+| `move_timeout_s` | `60.0` | per move, and for homing |
+| `settle_time_s` | `0.3` | extra wait once the mount reports it has arrived |
+| `angle_tolerance_deg` | `0.5` | how close counts as arrived |
+| `read_timeout_s` | `2.0` | per reply, for everything but a move |
+| `poll_interval_s` | `0.1` | how often the position is re-read while waiting |
+
+A move works differently from Kinesis and needs no polling loop: the mount answers the move command **only once it has stopped**, and the reply carries the position it ended on, which is then checked against the tolerance. Requested angles travel as a 32-bit count of encoder pulses, so degrees are scaled by the pulses-per-revolution the mount reports when it connects — printed on the `[ell] connected …` line, which is the quickest way to see that the mount was understood.
 
 ### 4.7 The pump mounts, and the two angle scans
 
@@ -624,26 +669,33 @@ angle scan.
 | `LASER_ANGLE_DEG` | `None` | the pump angle of **this** acquisition, set by the loop |
 | `LASER_ANGLE_PLOT_ANGLES` | `False` | also draw the full HBT tree of every angle |
 
-**The ellipticity scan** (§3.7) adds the analyzer plate after the crystal, and a sweep of
-it at each pump angle:
+**The ellipticity scan** (§3.7) adds the analyzer after the crystal, and a sweep of it at
+each pump angle:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `ELLIPTICITY_LASER_ANGLES` | `None` | the pump angles: the outer loop, and the x axis of the result |
-| `ELLIPTICITY_ANALYZER_ANGLES` | `np.arange(0, 180, 15)` | the plate angles swept at each of them: the inner loop |
-| `ELLIPTICITY_ANALYZER` | `None` | `RotationStageConfig` of the plate after the crystal |
-| `ELLIPTICITY_ANALYZER_ENABLED` | `False` | actually turn that plate |
+| `ELLIPTICITY_ANALYZER_ANGLES` | `np.arange(0, 180, 15)` | the analyzer angles swept at each of them: the inner loop |
+| `ELLIPTICITY_ANALYZER_KIND` | `"hwp"` | what is on the analyzer mount: `"hwp"` (plate in front of a fixed polarizer) or `"polarizer"` (the polarizer itself) |
+| `ELLIPTICITY_ANALYZER` | `None` | `RotationStageConfig` (Kinesis) or `ELLStageConfig` (Elliptec) of that mount |
+| `ELLIPTICITY_ANALYZER_ENABLED` | `False` | actually turn the analyzer |
 | `ELLIPTICITY_ANALYZER_DRY_RUN` | `False` | log the moves, import nothing, move nothing |
-| `ELLIPTICITY_ANALYZER_SETTLE_TIME_S` | `0.2` | extra pause after the plate has arrived |
-| `ELLIPTICITY_FIT_PERIOD_DEG` | `90.0` | the period of the fitted Malus curve; 90° for a HWP, 180° for a polarizer |
-| `ELLIPTICITY_FIXED_POLARIZER_DEG` | `0.0` | metadata only: the fixed polarizer, 0 = vertical |
-| `ANALYZER_ANGLE_DEG` | `None` | the plate angle of **this** acquisition, set by the loop |
+| `ELLIPTICITY_ANALYZER_SETTLE_TIME_S` | `0.2` | extra pause after the analyzer has arrived |
+| `ELLIPTICITY_FIT_PERIOD_DEG` | `None` → from the kind | the period of the fitted Malus curve: 90° for a HWP, 180° for a polarizer |
+| `ELLIPTICITY_FIXED_POLARIZER_DEG` | `0.0` | metadata, `"hwp"` only: the fixed polarizer, 0 = vertical |
+| `ANALYZER_ANGLE_DEG` | `None` | the analyzer angle of **this** acquisition, set by the loop |
 | `ELLIPTICITY_PLOT_POINTS` | `False` | also draw the full HBT tree of every point |
 
 Setting `ELLIPTICITY_LASER_ANGLES` is what selects the scan; the analyzer angles have a
 usable default because the 0–180° sweep is the normal one. `ELLIPTICITY_FIT_PERIOD_DEG`
-is a property of the optic, not a fitting preference: change it only if the analyzer is
-not a half-wave plate.
+is a property of the optic, not a fitting preference, which is why `None` reads it off
+`ELLIPTICITY_ANALYZER_KIND` rather than guessing: set it by hand only for an analyzer
+that is neither a half-wave plate nor a polarizer.
+
+`ELLIPTICITY_ANALYZER_KIND` is also the only record of which setup a folder was measured
+with — the file names of the two are identical — so it is written to
+`experiment_config.txt`, added as a column of `ellipticity_scan.csv`, and named on every
+ellipticity figure.
 
 ### 4.8 Validation and derived values
 
@@ -1032,16 +1084,22 @@ finished           = 2026-07-27 15:26:31
   power_label         = 50mW
   requested_power     = 50 (calibration unit)
   laser_angles_deg    = 0 to 90 step 45 (3 points)
-  analyzer_angles_deg = 0 to 165 step 15 (12 points)
-  analyzer_serial     = 27270568
+  analyzer_kind       = polarizer (rotating polarizer)
+  analyzer_angles_deg = 0 to 180 step 15 (13 points)
+  analyzer_stage      = Elliptec on COM6, address 0
   analyzer_motion     = yes
-  fixed_polarizer_deg = 0 (0 = vertical)
-  fit_period_deg      = 90
+  fit_period_deg      = 180
   per_angle_log       = ellipticity_scan.csv
   pump_motion         = yes
   pump_p1_serial      = 27270550
   pump_hwp_serial     = 27270567
   ```
+
+  `analyzer_kind` is the one line that says which of the two analyzers was on the bench
+  (§3.7), since their file names are identical; `fixed_polarizer_deg` joins it for
+  `analyzer_kind = hwp`, where there is a second, fixed polarizer to describe.
+  `analyzer_stage` is the controller serial number for a Kinesis mount, and the port and
+  bus address for an Elliptec one.
 * `ANALYZE_ONLY` writes the shared sections only, and only when the folder has no
   configuration file yet — reprocessing never invents a run that did not happen, and
   never overwrites the record of one that did.
@@ -1099,16 +1157,19 @@ laser_angle_deg,power_label,requested_power,unit,p1_angle_deg,hwp_angle_deg,reac
   polar figures instead of a point at the wrong power.
 * Re-running a point replaces its row; rows stay sorted by angle.
 
-`ellipticity_scan.csv` is the same table with `analyzer_angle_deg` as its second column
-and no reachability columns — reachability is a property of the pump angle, and a pump
-angle the table cannot serve writes one `unreachable` row per point of its sweep, so the
-log says exactly what was not recorded:
+`ellipticity_scan.csv` is the same table with `analyzer_angle_deg` and `analyzer_kind` as
+its next columns and no reachability columns — reachability is a property of the pump
+angle, and a pump angle the table cannot serve writes one `unreachable` row per point of
+its sweep, so the log says exactly what was not recorded:
 
 ```csv
-laser_angle_deg,analyzer_angle_deg,power_label,requested_power,unit,p1_angle_deg,hwp_angle_deg,status,chunks,duration_s,recorded_at,note
-0,0,50mW_las000p0_hwp000p0,50,mW,0,22.5,complete,4,120,2026-07-30 14:27:32,
-0,15,50mW_las000p0_hwp015p0,50,mW,0,22.5,complete,4,120,2026-07-30 14:29:41,
+laser_angle_deg,analyzer_angle_deg,analyzer_kind,power_label,requested_power,unit,p1_angle_deg,hwp_angle_deg,status,chunks,duration_s,recorded_at,note
+0,0,polarizer,50mW_las000p0_hwp000p0,50,mW,0,22.5,complete,4,120,2026-07-30 14:27:32,
+0,15,polarizer,50mW_las000p0_hwp015p0,50,mW,0,22.5,complete,4,120,2026-07-30 14:29:41,
 ```
+
+`analyzer_kind` is `hwp` or `polarizer` (§3.7): the file names of the two are identical,
+so the log is where a row says which optic its angle belongs to.
 
 Both logs are also what the analysis reads to know which points exist: it prefers the
 log over the configured plan, so a folder replays as it was actually recorded rather
@@ -1294,14 +1355,29 @@ manager, dry-run). Details that are not obvious from the Kinesis documentation:
 * Benchtop controllers expose one channel per axis: the object that moves is
   `device.GetChannel(channel)`, the one that disconnects is the controller.
 
+**Part 1b — one Elliptec mount.** `ELLStageConfig` (§4.6b) and `ELLStage`, the same
+methods over the serial protocol instead of Kinesis, plus `make_stage` /
+`stage_is_addressed` / `describe_stage`, which are how the rest of the code takes either
+kind without asking which. Details that are not obvious from the Elliptec manual:
+
+* every message is `<address><2-letter command><data>` + CRLF, and so is every reply;
+  `_read_reply` skips lines carrying another address, since one interface board can
+  serve several mounts.
+* `ma` (move absolute) answers **only when the move has finished**, and its reply
+  carries the position reached — there is no motion flag to poll.
+* positions are a 32-bit two's-complement count of encoder **pulses**; the `in` reply
+  gives the travel range and the pulses per revolution, whose ratio is the counts per
+  degree (398.222 for an ELL14).
+
 **Part 2 — the pump's polarization.** `LookupTable`, `PumpController`, `preflight`.
 Reads the P1/HWP lookup table, picks the smallest HWP angle that delivers the requested
 power, moves P1 then the HWP. Same conventions as the lab's calibration script (§3.6).
 
-**Part 3 — the analyzer, and the scan logs.** `AnalyzerController` is the plate after the
-crystal: a thin wrapper over `RotationStage` with no calibration behind it, so that an
-ellipticity scan reads like the pump half of a run (a context manager, one `set_angle`
-per point, the same settle time, the same dry run). `LaserAngleLog` and `EllipticityLog`
+**Part 3 — the analyzer, and the scan logs.** `AnalyzerController` is the mount after the
+crystal — the half-wave plate or the polarizer, §3.7: a thin wrapper over whichever
+driver `make_stage` returns, with no calibration behind it, so that an ellipticity scan
+reads like the pump half of a run (a context manager, one `set_angle` per point, the same
+settle time, the same dry run). `LaserAngleLog` and `EllipticityLog`
 share a `_CsvLog` base and write the two tables of §6.4 — one row per point, keyed by
 its file label, so re-running a point replaces its row.
 
@@ -1589,7 +1665,7 @@ one line:
 | To check | Set | What still happens |
 | --- | --- | --- |
 | the configuration is valid | *(nothing)* | `python src/config_examples.py`, or just build your `ExperimentConfig`: §4.8 runs at construction |
-| the scan plan and the angles | `ROTATION_STAGE_DRY_RUN=True`, `PUMP_STAGE_DRY_RUN=True`, `ELLIPTICITY_ANALYZER_DRY_RUN=True` | the loop, the angle for every point, the preflight against the lookup table, `experiment_config.txt` — every move is printed, no mount is touched, and no Kinesis import is attempted |
+| the scan plan and the angles | `ROTATION_STAGE_DRY_RUN=True`, `PUMP_STAGE_DRY_RUN=True`, `ELLIPTICITY_ANALYZER_DRY_RUN=True` | the loop, the angle for every point, the preflight against the lookup table, `experiment_config.txt` — every move is printed, no mount is touched, and no Kinesis or pyserial import is attempted |
 | the analysis and the figures | `ANALYZE_ONLY=True` | the whole plot tree, on data already in `DATA_DIR` |
 
 Only the acquisition itself needs the tagger, so an angle scan can be rehearsed end to
@@ -1599,7 +1675,7 @@ end but for the counts:
 ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0],
 PUMP_POWER=50.0,
 PUMP_STAGE_DRY_RUN=True,              # prints every P1 / HWP angle, moves nothing
-ELLIPTICITY_ANALYZER_DRY_RUN=True,    # prints every plate angle, moves nothing
+ELLIPTICITY_ANALYZER_DRY_RUN=True,    # prints every analyzer angle, moves nothing
 ```
 
 That prints the preflight — which pump angles the table can serve at that power, and
@@ -1645,6 +1721,24 @@ wrong from the serial number, in which case the message lists the known families
 `device_type` picks one explicitly. A controller that is not listed at all needs an
 entry in `DEVICE_CLASSES` (§8.2).
 
+### 10.20b `TimeoutError: No reply from the Elliptec mount at address …`
+
+Nothing answered on that COM port. The three causes, in order: the port is wrong (an
+Elliptec enumerates as `COM3`, `COM4`, … under Windows and `/dev/ttyUSB0` elsewhere, and
+the number moves when it is replugged into another socket); the bus address is wrong
+(`"0"` for a mount straight out of the box, another digit if it was readdressed or shares
+an interface board); or another program still holds the port — the Elliptec GUI keeps it
+open, and only one process at a time can. `ImportError: Reaching an Elliptec mount needs
+pyserial` is the simpler neighbour of this one: `pip install pyserial` (§4.6b).
+
+### 10.20c `RuntimeError: The Elliptec mount refused '…'`
+
+The mount answered, and said no. The message quotes its own status word: `value out of
+range` is an angle outside the mount's travel, `sensor error` or `initialising error`
+usually clears with a `home()` (`home_on_connect=True`), and `busy` means a previous
+command is still running — raise `move_timeout_s`. `mechanical time out` is the physical
+one: something is blocking the mount.
+
 ### 10.21 `TimeoutError: Rotation stage did not reach … deg`
 
 The stage stopped short of `angle_tolerance_deg`. In order of likelihood: it was never
@@ -1671,20 +1765,23 @@ the full `POWER_LEVELS`.
 
 ### 10.24 Every ellipticity comes out at 1 (circular)
 
-An ellipticity of 1 means the fitted curve was flat, and a plate that never moved
+An ellipticity of 1 means the fitted curve was flat, and an analyzer that never moved
 produces exactly that. Check `analyzer_motion` in `[ellipticity_scan]`: `dry run (angles
 logged, nothing moved)` means `ELLIPTICITY_ANALYZER_DRY_RUN` was left on from a rehearsal.
 (The combination "ellipticity scan configured, `ELLIPTICITY_ANALYZER_ENABLED=False`" is
 refused outright, for this reason.) Otherwise look at
 `summary/sinusoid_fits_{harmonic}.png`: a genuine circular emission is a flat curve
-through scattered points, a plate that did not move is a flat curve through points with
-no scatter at all. Do not read R² as the alarm here — a flat curve has no variance to
+through scattered points, an analyzer that did not move is a flat curve through points
+with no scatter at all. Do not read R² as the alarm here — a flat curve has no variance to
 explain, so R² collapses towards 0 for **any** near-circular sweep, honest ones included.
 
 Read the other end of the scale the same way: ε ≈ 0 with an R² near 1 is a linear
-polarization, ε ≈ 0 with a poor R² usually means the sweep is not a sinusoid of period 90°
-at all — check that the analyzer really is a half-wave plate and that
-`ELLIPTICITY_FIT_PERIOD_DEG` matches it.
+polarization, ε ≈ 0 with a poor R² usually means the sweep is not a sinusoid of the
+fitted period at all — check that `ELLIPTICITY_ANALYZER_KIND` matches what is really on
+the mount (a polarizer sweep fitted as a half-wave plate, or the reverse, is fitted at
+twice or half the right frequency and gives nonsense at any ε). The title of every
+ellipticity figure names the kind it was drawn with, and `fit_period_deg` in
+`[ellipticity_scan]` is the number it produced: 90° for the plate, 180° for the polarizer.
 
 ### 10.25 `fewer than 4 analyzer angles with data, sweep skipped`
 

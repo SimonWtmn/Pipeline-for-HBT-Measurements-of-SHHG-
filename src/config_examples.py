@@ -20,7 +20,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from experiment_config import ExperimentConfig  # noqa: E402
-from hardware import RotationStageConfig  # noqa: E402
+from hardware import ELLStageConfig, RotationStageConfig  # noqa: E402
 
 # The four channels of the David setup: transmitted and reflected arm of each harmonic.
 MODES = {1: "H3T", 5: "H3R", 10: "H5T", 14: "H5R"}
@@ -148,12 +148,17 @@ LASER_ANGLE_SCAN = ExperimentConfig(
 # ----------------------------------------------------------------------------
 # 4. An ellipticity scan - an analyzer sweep at each pump angle
 # ----------------------------------------------------------------------------
-# The pump mounts hold one laser angle while the half-wave plate AFTER the crystal turns
-# through its sweep in front of the fixed vertical polarizer. The intensity it transmits
-# traces a sinusoid of period 90 deg whose depth gives the ellipticity of the harmonics:
-# a curve reaching zero is a linear polarization, a flat one is circular.
+# The pump mounts hold one laser angle while the analyzer AFTER the crystal turns
+# through its sweep. The intensity it transmits traces a sinusoid whose depth gives the
+# ellipticity of the harmonics: a curve reaching zero is a linear polarization, a flat
+# one is circular.
 #
-# Three mounts move here, so all three serial numbers must be right:
+# This is the HWP version: a half-wave plate turns in front of a polarizer that never
+# moves. The plate turns the polarization by twice its own angle, so the curve repeats
+# every 90 deg. Example 4b below is the same scan with the polarizer itself on the
+# mount and no plate at all.
+#
+# Three mounts move here, so all three must be addressed:
 #   PUMP_P1 / PUMP_HWP  before the crystal, ELLIPTICITY_ANALYZER after it.
 # Results land under:
 #   results/.../ellipticity/{POWER}/las000p0/  ← that sweep and its fit
@@ -173,11 +178,63 @@ ELLIPTICITY_SCAN = ExperimentConfig(
 
     ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0, 135.0],
     ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 180.0, 15.0),
+    ELLIPTICITY_ANALYZER_KIND="hwp",        # plate in front of the fixed polarizer
     ELLIPTICITY_ANALYZER_ENABLED=True,
     ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27260004", clockwise=True),
     ELLIPTICITY_ANALYZER_DRY_RUN=True,      # rehearse first, as above
-    ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # a half-wave plate repeats every 90 deg
+    ELLIPTICITY_FIT_PERIOD_DEG=None,        # None -> 90 deg, the plate's own period
     ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata: 0 = vertical
+
+    PUMP_POWER=50.0,
+    PUMP_STAGE_ENABLED=True,
+    PUMP_P1=RotationStageConfig(serial_number="27260002", clockwise=True),
+    PUMP_HWP=RotationStageConfig(serial_number="27260003", clockwise=True),
+    PUMP_STAGE_DRY_RUN=True,
+
+    INTEGRATION_WINDOW=8,
+    INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
+    RUN_ANALYSIS_AFTER_ACQUIRE=True,
+)
+
+
+# ----------------------------------------------------------------------------
+# 4b. The same scan with the polarizer on the mount, and no half-wave plate
+# ----------------------------------------------------------------------------
+# The plate comes out of the beam and the polarizer itself is turned, on a Thorlabs
+# Elliptec mount: a serial port rather than a Kinesis serial number, which is the only
+# thing ELLStageConfig changes. Everything downstream is identical - the same file
+# names, the same fits, the same figures - except that the transmitted curve now
+# repeats every 180 deg instead of 90, which ELLIPTICITY_ANALYZER_KIND takes care of.
+#
+# The kind is written to experiment_config.txt and to ellipticity_scan.csv, and named on
+# every figure, because the two setups are otherwise indistinguishable on disk.
+
+ELLIPTICITY_SCAN_POLARIZER = ExperimentConfig(
+    MATERIAL="ZnO100",
+    EXPERIENCE_TYPE="David_Setup",
+    DATE="27072026",
+    POWER_LEVEL="50mW",
+
+    MODES=MODES,
+    CORR_BINWIDTH_PS=300,
+    CORR_N_BINS=2009,
+    ACQUISITION_DURATION_S=120.0,
+    CHUNK_DURATION_S=30.0,
+
+    ELLIPTICITY_LASER_ANGLES=[0.0, 45.0, 90.0, 135.0],
+    # 0 to 180 inclusive: the mirrored half is drawn from it, so the polar figures come
+    # out as full circles rather than semicircles.
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 15.0),
+    ELLIPTICITY_ANALYZER_KIND="polarizer",  # the polarizer itself, no plate in the beam
+    ELLIPTICITY_ANALYZER_ENABLED=True,
+    ELLIPTICITY_ANALYZER=ELLStageConfig(
+        port="COM6",                        # the port the Elliptec mount enumerated as
+        address="0",                        # its bus address, '0' unless several share it
+        clockwise=True,
+        home_on_connect=False,
+    ),
+    ELLIPTICITY_ANALYZER_DRY_RUN=True,      # rehearse first, as above
+    ELLIPTICITY_FIT_PERIOD_DEG=None,        # None -> 180 deg, a polarizer's own period
 
     PUMP_POWER=50.0,
     PUMP_STAGE_ENABLED=True,
@@ -241,7 +298,8 @@ EXAMPLES = {
     "single power": SINGLE_POWER,
     "power scan": POWER_SCAN,
     "laser angle scan": LASER_ANGLE_SCAN,
-    "ellipticity scan": ELLIPTICITY_SCAN,
+    "ellipticity scan (HWP)": ELLIPTICITY_SCAN,
+    "ellipticity scan (polarizer)": ELLIPTICITY_SCAN_POLARIZER,
     "laser angle overlay": LASER_ANGLE_OVERLAY,
     "analysis only": ANALYZE_ONLY,
 }

@@ -3,12 +3,15 @@ top of them.
 
 * `RotationStage` drives a single Thorlabs mount through Kinesis. A power scan uses
   one of these on its own, to turn a wave plate to a calibrated angle per power.
+* `ELLStage` drives a Thorlabs Elliptec mount (ELL14, ELL18…) over its serial port
+  instead, and offers the same handful of methods, so anything that turns a mount can
+  take either kind.
 * `PumpController` drives the pump's half-wave plate and polarizer together (BEFORE
   the crystal), reading the angles it needs from a P1/HWP lookup table recorded
   beforehand. `LookupTable`, `LaserAngleLog` and `preflight` belong to that half.
-* `AnalyzerController` drives the single half-wave plate AFTER the crystal, in front of
-  the fixed polarizer, which is what an ellipticity scan turns. `EllipticityLog`
-  records its sweeps.
+* `AnalyzerController` drives the one mount AFTER the crystal that an ellipticity scan
+  turns - either the half-wave plate in front of a fixed polarizer, or the polarizer
+  itself. `EllipticityLog` records its sweeps.
 
 No hardware library is imported until something actually connects, which is what lets
 every dry run, analysis and replot happen on a laptop.
@@ -24,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -425,6 +428,357 @@ class RotationStage:
 
 
 # ============================================================================
+# PART 1b - a Thorlabs Elliptec (ELLx) rotation mount
+# ============================================================================
+#
+# The Elliptec mounts are not Kinesis devices: they answer a short ASCII protocol on a
+# virtual COM port instead of a .NET API, so they need their own driver rather than
+# another entry in DEVICE_CLASSES. Everything the rest of this file asks of a mount
+# (`connect`, `move_to_angle_deg`, `get_angle_deg`, `home`, `disconnect`) is here under
+# the same names, so `AnalyzerController` takes either kind without knowing which.
+#
+# The protocol, from the Elliptec communications manual: every message is
+# `<address><2-letter command><data>` followed by CR LF, and every reply comes back the
+# same way. The three that matter are `in` (what the device is), `gp` (where it is) and
+# `ma` (move there, answering only once the move is finished). Positions travel as a
+# 32-bit two's-complement count of encoder pulses, so degrees have to be scaled by the
+# pulses-per-revolution the device reports in its `in` reply.
+
+ELL_INFO_COMMAND = "in"
+ELL_TERMINATOR = b"\r\n"
+
+# The status codes an ELL device answers with, from the same manual. 0 is not an error:
+# a move replies `GS00` when it has nothing else to say.
+ELL_STATUS = {
+    0: "ok",
+    1: "communication time out",
+    2: "mechanical time out",
+    3: "command error or not supported",
+    4: "value out of range",
+    5: "module isolated",
+    6: "module out of isolation",
+    7: "initialising error",
+    8: "thermal error",
+    9: "busy",
+    10: "sensor error (the stage may need re-homing)",
+    11: "motor error",
+    12: "out of range",
+    13: "over current error",
+}
+
+_PYSERIAL_HINT = (
+    "Reaching an Elliptec mount needs pyserial (`pip install pyserial`), which opens "
+    "the virtual COM port the mount enumerates as. Set ELLIPTICITY_ANALYZER_DRY_RUN="
+    "True to rehearse a scan with no hardware at all."
+)
+
+
+@dataclass
+class ELLStageConfig:
+    """A Thorlabs Elliptec rotation mount (ELL14, ELL18…) on a serial port.
+
+    `port` is what the mount enumerated as: "COM5" on Windows, "/dev/tty.usbserial-XXXX"
+    on macOS, "/dev/ttyUSB0" on Linux. `address` is the bus address set in the Elliptec
+    software, '0' unless several mounts share one interface board.
+    """
+
+    port: str = ""
+    address: str = "0"
+    baudrate: int = 9600
+    #: False negates every requested angle, i.e. the mount reads anticlockwise. Same
+    #: meaning as RotationStageConfig.clockwise.
+    clockwise: bool = True
+    home_on_connect: bool = False
+    home_clockwise: bool = True
+    #: None reads the scaling from the device's own `in` reply, which is what it should
+    #: be; set it only for a mount that reports its pulses per revolution wrongly.
+    counts_per_degree: Optional[float] = None
+    move_timeout_s: float = 60.0
+    settle_time_s: float = 0.3
+    #: An ELL14 resolves about 0.003 deg but repeats to roughly 0.1: the check below is
+    #: on the position the mount reports, so this only has to catch a move that failed.
+    angle_tolerance_deg: float = 0.5
+    read_timeout_s: float = 2.0
+    poll_interval_s: float = 0.1
+
+
+class ELLStage:
+    """A Thorlabs Elliptec rotation mount, driven over its serial port.
+
+    Same surface as `RotationStage`, including `dry_run=True` printing the angles it
+    would have turned to without opening anything.
+    """
+
+    def __init__(self, config: ELLStageConfig, dry_run: bool = False) -> None:
+        self.config = config
+        self.dry_run = dry_run
+        self._port = None                     # the pyserial connection
+        self._counts_per_degree: Optional[float] = config.counts_per_degree
+        self._simulated_angle = 0.0
+
+    # ---------- lifecycle ----------
+
+    def __enter__(self) -> "ELLStage":
+        self.connect()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.disconnect()
+        return False
+
+    def connect(self) -> None:
+        if self.dry_run:
+            print(f"[ell] dry run: not connecting (port {self.config.port or 'unset'})")
+            return
+
+        if not self.config.port:
+            raise ValueError(
+                "ELLStageConfig.port is empty: it is the serial port the Elliptec mount "
+                "enumerated as (\"COM5\", \"/dev/tty.usbserial-...\"), listed by the "
+                "Elliptec software or by the operating system."
+            )
+
+        serial = self._load_pyserial()
+        self._port = serial.Serial(
+            port=self.config.port,
+            baudrate=self.config.baudrate,
+            bytesize=8,
+            parity="N",
+            stopbits=1,
+            timeout=self.config.read_timeout_s,
+            write_timeout=self.config.read_timeout_s,
+        )
+
+        # An interface board that has just been opened can hold the tail of an earlier
+        # session's reply, which would be read as the answer to the first command.
+        try:
+            self._port.reset_input_buffer()
+            self._port.reset_output_buffer()
+            info = self.device_info()
+            self._counts_per_degree = (self.config.counts_per_degree
+                                       or info.get("counts_per_degree"))
+            if not self._counts_per_degree:
+                raise RuntimeError(
+                    "The Elliptec mount did not report how many encoder pulses make a "
+                    "degree. Set ELLStageConfig.counts_per_degree (398.222 for an ELL14)."
+                )
+            print(f"[ell] connected to {info.get('device_type', '?')} "
+                  f"{info.get('serial_number', '?')} on {self.config.port}, "
+                  f"{self._counts_per_degree:.3f} counts/deg, "
+                  f"now at {self.get_angle_deg():.3f} deg")
+            if self.config.home_on_connect:
+                self.home()
+        except Exception:
+            self.disconnect()
+            raise
+
+    def disconnect(self) -> None:
+        if self.dry_run or self._port is None:
+            self._port = None
+            return
+        try:
+            self._port.close()
+            print("[ell] disconnected")
+        finally:
+            self._port = None
+
+    # ---------- motion ----------
+
+    def raw_angle(self, angle_deg: float) -> float:
+        """The requested angle in the mount's own frame: signed, then wrapped."""
+        sign = 1.0 if self.config.clockwise else -1.0
+        return wrap_360(sign * float(angle_deg))
+
+    def get_angle_deg(self) -> float:
+        if self.dry_run:
+            return self._simulated_angle
+        return self._degrees(self._position_reply("gp"))
+
+    def move_to_angle_deg(self, angle_deg: float, *, wait: bool = True) -> None:
+        raw = self.raw_angle(angle_deg)
+        raw_note = "" if raw == float(angle_deg) else f", raw {raw:g}"
+
+        if self.dry_run:
+            print(f"[ell] dry run: would move to {angle_deg:g} deg{raw_note}")
+            self._simulated_angle = raw
+            return
+
+        self._require_connection()
+        print(f"[ell] moving to {angle_deg:g} deg{raw_note} (from {self.get_angle_deg():.3f} deg)")
+        # `ma` answers only once the mount has stopped, so unlike Kinesis there is no
+        # motion flag to watch: the reply IS the arrival, and the position it carries is
+        # where the mount ended up.
+        arrived = self._degrees(self._position_reply("ma", self._counts_hex(raw),
+                                                     timeout_s=self.config.move_timeout_s))
+        if wait:
+            arrived = self.wait_until_angle(angle_deg, arrived)
+        print(f"[ell] arrived at {arrived:.3f} deg")
+
+    def wait_until_angle(self, angle_deg: float, arrived: Optional[float] = None) -> float:
+        """Re-read the position until it is within tolerance of the target."""
+        if self.dry_run:
+            return self._simulated_angle
+
+        raw = self.raw_angle(angle_deg)
+        deadline = time.monotonic() + self.config.move_timeout_s
+        current = self.get_angle_deg() if arrived is None else arrived
+        while abs(angular_difference(current, raw)) > self.config.angle_tolerance_deg:
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Elliptec mount did not reach {angle_deg:g} deg within "
+                    f"{self.config.move_timeout_s:g} s (stopped at {current:.3f} deg). "
+                    "Check for an obstruction, or home the mount."
+                )
+            time.sleep(self.config.poll_interval_s)
+            current = self.get_angle_deg()
+
+        if self.config.settle_time_s > 0:
+            time.sleep(self.config.settle_time_s)
+        return current
+
+    def home(self) -> None:
+        if self.dry_run:
+            print("[ell] dry run: would home")
+            self._simulated_angle = 0.0
+            return
+        self._require_connection()
+        print("[ell] homing...")
+        direction = "0" if self.config.home_clockwise else "1"
+        angle = self._degrees(self._position_reply("ho", direction,
+                                                   timeout_s=self.config.move_timeout_s))
+        print(f"[ell] homed, now at {angle:.3f} deg")
+
+    # ---------- the device itself ----------
+
+    def device_info(self) -> Dict[str, Any]:
+        """What the mount says it is, from its `in` reply.
+
+        The reply packs the model, the serial number, the travel range and the pulses
+        per revolution into fixed-width fields; the last two are what turn a requested
+        angle into the encoder count the mount takes.
+        """
+        reply = self._command(ELL_INFO_COMMAND)
+        if len(reply) < 33 or reply[1:3].upper() != "IN":
+            raise RuntimeError(f"Unexpected reply to the Elliptec info request: {reply!r}")
+        travel = int(reply[21:25], 16)
+        pulses = int(reply[25:33], 16)
+        return {
+            "device_type": f"ELL{int(reply[3:5], 16)}",
+            "serial_number": reply[5:13],
+            "year": reply[13:17],
+            "firmware": reply[17:19],
+            "travel_deg": travel,
+            "pulses_per_revolution": pulses,
+            "counts_per_degree": pulses / travel if travel else pulses / 360.0,
+        }
+
+    def status(self) -> Tuple[int, str]:
+        """(code, what it means) of the mount's last operation."""
+        reply = self._command("gs")
+        code = int(reply[3:5], 16) if len(reply) >= 5 else -1
+        return code, ELL_STATUS.get(code, "unknown status")
+
+    # ---------- internals ----------
+
+    def _require_connection(self) -> None:
+        if self._port is None:
+            raise RuntimeError("Elliptec mount is not connected: call connect() first.")
+
+    def _degrees(self, counts: int) -> float:
+        return wrap_360(counts / float(self._counts_per_degree))
+
+    def _counts_hex(self, angle_deg: float) -> str:
+        """A mount angle as the 8-digit two's-complement hex the protocol takes."""
+        counts = int(round(wrap_360(angle_deg) * float(self._counts_per_degree)))
+        return f"{counts & 0xFFFFFFFF:08X}"
+
+    def _position_reply(self, command: str, data: str = "",
+                        timeout_s: Optional[float] = None) -> int:
+        """Send a command that answers with a position, and return it in pulses."""
+        reply = self._command(command, data, timeout_s=timeout_s)
+        code = reply[1:3].upper()
+        if code == "PO":
+            value = int(reply[3:11], 16)
+            # 32-bit two's complement: the mount can report a negative count.
+            return value - 0x1_0000_0000 if value >= 0x8000_0000 else value
+        if code == "GS":
+            number = int(reply[3:5], 16)
+            raise RuntimeError(
+                f"The Elliptec mount refused '{command}': "
+                f"{ELL_STATUS.get(number, 'unknown status')} (code {number})."
+            )
+        raise RuntimeError(f"Unexpected reply to the Elliptec '{command}': {reply!r}")
+
+    def _command(self, command: str, data: str = "",
+                 timeout_s: Optional[float] = None) -> str:
+        """Send one message and return the reply addressed to this mount."""
+        self._require_connection()
+        message = f"{self.config.address}{command}{data}"
+        self._port.write(message.encode("ascii") + ELL_TERMINATOR)
+        self._port.flush()
+        return self._read_reply(timeout_s if timeout_s is not None
+                                else self.config.read_timeout_s)
+
+    def _read_reply(self, timeout_s: float) -> str:
+        """The next non-empty line addressed to this mount, within `timeout_s`.
+
+        Lines carrying another address are skipped rather than returned: several mounts
+        can share one interface board, and a neighbour's reply is not this one's.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() <= deadline:
+            line = self._port.read_until(ELL_TERMINATOR).decode("ascii", "replace").strip()
+            if line and line[0].upper() == self.config.address.upper():
+                return line
+        raise TimeoutError(
+            f"No reply from the Elliptec mount at address {self.config.address} on "
+            f"{self.config.port} within {timeout_s:g} s. Check the port, the address, "
+            "and that no other program holds the mount."
+        )
+
+    @staticmethod
+    def _load_pyserial():
+        try:
+            import serial  # noqa: PLC0415 - imported here so a laptop needs no driver
+        except ImportError as exc:
+            raise ImportError(_PYSERIAL_HINT) from exc
+        return serial
+
+
+# ----------------------------------------------------------------------------
+# Either kind of mount, told apart by its configuration
+# ----------------------------------------------------------------------------
+
+StageConfig = Union[RotationStageConfig, ELLStageConfig]
+Stage = Union[RotationStage, ELLStage]
+
+
+def make_stage(config: StageConfig, dry_run: bool = False) -> Stage:
+    """The driver a mount configuration asks for: Elliptec serial, or Kinesis."""
+    if isinstance(config, ELLStageConfig):
+        return ELLStage(config, dry_run=dry_run)
+    return RotationStage(config, dry_run=dry_run)
+
+
+def stage_is_addressed(config: Optional[StageConfig]) -> bool:
+    """Whether a mount configuration names the device it is meant to drive."""
+    if config is None:
+        return False
+    if isinstance(config, ELLStageConfig):
+        return bool(config.port)
+    return bool(getattr(config, "serial_number", ""))
+
+
+def describe_stage(config: Optional[StageConfig]) -> str:
+    """How a mount is identified in the configuration file: serial, or port."""
+    if config is None:
+        return "(none)"
+    if isinstance(config, ELLStageConfig):
+        return f"Elliptec on {config.port or '(no port)'}, address {config.address}"
+    return getattr(config, "serial_number", "") or "(none)"
+
+
+# ============================================================================
 # PART 2 - the pump's linear polarization, from a measured lookup table
 # ============================================================================
 #
@@ -464,11 +818,13 @@ SCAN_LOG_COLUMNS = [
     "note",
 ]
 
-# The analyzer sweep adds its own angle, and drops the reachability of the pump power:
-# a point is only recorded once the pump angle is known to be reachable.
+# The analyzer sweep adds its own angle and which optic carried it, and drops the
+# reachability of the pump power: a point is only recorded once the pump angle is known
+# to be reachable.
 ELLIPTICITY_LOG_COLUMNS = [
     "laser_angle_deg",
     "analyzer_angle_deg",
+    "analyzer_kind",
     "power_label",
     "requested_power",
     "unit",
@@ -751,26 +1107,35 @@ def preflight(lookup: LookupTable, angles_deg: Sequence[float], power: float) ->
 # PART 3 - the analyzer after the crystal
 # ============================================================================
 #
-# One half-wave plate, in front of a polarizer that never moves. Turning the plate by
-# theta turns the harmonic polarization by 2*theta, so what the polarizer transmits
-# repeats every 90 deg of plate angle: a sweep over 0-180 deg samples that curve twice.
+# One mount, turned to one angle at a time, and two ways of building the analyzer it
+# carries:
 #
-# No calibration is involved - the plate angle IS the requested angle. The measurement
-# is the shape of the transmitted intensity, not its absolute value.
+# * a half-wave plate in front of a polarizer that never moves. Turning the plate by
+#   theta turns the harmonic polarization by 2*theta, so what the polarizer transmits
+#   repeats every 90 deg of plate angle: a sweep over 0-180 deg samples that curve twice;
+# * the polarizer itself, on an Elliptec mount, with no plate at all. What it transmits
+#   then repeats every 180 deg, so the same 0-180 sweep samples the curve once.
+#
+# Only the period of the fitted curve tells them apart (ELLIPTICITY_FIT_PERIOD_DEG),
+# which is why the configuration records which one was mounted. No calibration is
+# involved either way - the mount angle IS the requested angle, and the measurement is
+# the shape of the transmitted intensity, not its absolute value.
 
 class AnalyzerController:
-    """The half-wave plate after the crystal, turned to one angle at a time.
+    """The mount after the crystal, turned to one angle at a time.
 
-    A thin wrapper over `RotationStage`: it exists so an ellipticity scan reads the same
-    way as the pump half of a run (a context manager, one `set_angle` per point, the
-    same settle time), and so `dry_run` prints what it would have turned.
+    A thin wrapper over a `RotationStage` or an `ELLStage`: it exists so an ellipticity
+    scan reads the same way as the pump half of a run (a context manager, one
+    `set_angle` per point, the same settle time), and so `dry_run` prints what it would
+    have turned. `element` only names the optic in the log lines.
     """
 
-    def __init__(self, config: RotationStageConfig, dry_run: bool = False,
-                 settle_time_s: float = 0.2) -> None:
-        self.stage = RotationStage(config, dry_run=dry_run)
+    def __init__(self, config: StageConfig, dry_run: bool = False,
+                 settle_time_s: float = 0.2, element: str = "plate") -> None:
+        self.stage = make_stage(config, dry_run=dry_run)
         self.dry_run = dry_run
         self.settle_time_s = settle_time_s
+        self.element = element
 
     def __enter__(self) -> "AnalyzerController":
         self.connect()
@@ -787,8 +1152,8 @@ class AnalyzerController:
         self.stage.disconnect()
 
     def set_angle(self, angle_deg: float) -> float:
-        """Turn the plate to `angle_deg`, then let the beam settle."""
-        print(f"[analyzer] plate to {angle_deg:g} deg")
+        """Turn the analyzer to `angle_deg`, then let the beam settle."""
+        print(f"[analyzer] {self.element} to {angle_deg:g} deg")
         self.stage.move_to_angle_deg(angle_deg)
         if self.settle_time_s > 0 and not self.dry_run:
             time.sleep(self.settle_time_s)
@@ -885,16 +1250,26 @@ class LaserAngleLog(_CsvLog):
 
 
 class EllipticityLog(_CsvLog):
-    """`ellipticity_scan.csv`: one row per (pump angle, analyzer angle) pair."""
+    """`ellipticity_scan.csv`: one row per (pump angle, analyzer angle) pair.
+
+    `analyzer_kind` says which optic the sweep turned - the half-wave plate in front of
+    the fixed polarizer, or the polarizer itself - since the two are indistinguishable
+    in the file names and give sinusoids of different periods.
+    """
 
     columns = ELLIPTICITY_LOG_COLUMNS
     sort_keys = ("laser_angle_deg", "analyzer_angle_deg")
+
+    def __init__(self, path: Path, analyzer_kind: str = "") -> None:
+        super().__init__(path)
+        self.analyzer_kind = analyzer_kind
 
     def record(self, label: str, laser_angle_deg: float, analyzer_angle_deg: float,
                setting: Setting, status: str, result: Any = None, note: str = "") -> Path:
         self.rows[label] = {
             "laser_angle_deg": f"{float(laser_angle_deg):g}",
             "analyzer_angle_deg": f"{float(analyzer_angle_deg):g}",
+            "analyzer_kind": self.analyzer_kind,
             "power_label": label,
             "requested_power": f"{setting.requested_power:g}",
             "unit": setting.unit,
