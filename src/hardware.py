@@ -466,6 +466,29 @@ ELL_STATUS = {
     13: "over current error",
 }
 
+# Status codes that a re-home is likely to clear: the sensor loses track of where it is
+# (code 10), or the move ran past the point the mount could still resolve (code 12). When
+# a move answers with one of these, the mount needs homing to a known reference before it
+# will move reliably again.
+ELL_REHOMEABLE_STATUS = frozenset({10, 12})
+
+
+class ELLStatusError(RuntimeError):
+    """An Elliptec mount answered a command with a non-zero status (GS) code.
+
+    `code` is the raw status number (see `ELL_STATUS`); `rehomeable` says whether a
+    re-home is expected to clear it, so callers can recover instead of aborting.
+    """
+
+    def __init__(self, command: str, code: int) -> None:
+        self.command = command
+        self.code = code
+        self.rehomeable = code in ELL_REHOMEABLE_STATUS
+        super().__init__(
+            f"The Elliptec mount refused '{command}': "
+            f"{ELL_STATUS.get(code, 'unknown status')} (code {code})."
+        )
+
 _PYSERIAL_HINT = (
     "Reaching an Elliptec mount needs pyserial (`pip install pyserial`), which opens "
     "the virtual COM port the mount enumerates as. Set ELLIPTICITY_ANALYZER_DRY_RUN="
@@ -495,6 +518,9 @@ class ELLStageConfig:
     counts_per_degree: Optional[float] = None
     move_timeout_s: float = 60.0
     settle_time_s: float = 0.3
+    #: How many times to re-home and retry a move that fails with a re-homeable sensor
+    #: error (code 10) rather than aborting the scan. 0 disables the recovery.
+    rehome_retries: int = 2
     #: An ELL14 resolves about 0.003 deg but repeats to roughly 0.1: the check below is
     #: on the position the mount reports, so this only has to catch a move that failed.
     angle_tolerance_deg: float = 0.5
@@ -608,11 +634,30 @@ class ELLStage:
         # `ma` answers only once the mount has stopped, so unlike Kinesis there is no
         # motion flag to watch: the reply IS the arrival, and the position it carries is
         # where the mount ended up.
-        arrived = self._degrees(self._position_reply("ma", self._counts_hex(raw),
-                                                     timeout_s=self.config.move_timeout_s))
+        arrived = self._degrees(self._move_counts(raw))
         if wait:
             arrived = self.wait_until_angle(angle_deg, arrived)
         print(f"[ell] arrived at {arrived:.3f} deg")
+
+    def _move_counts(self, raw: float) -> int:
+        """Send the move and return the pulse count it arrives at.
+
+        A mount that has lost its bearings answers the move with a sensor error (code
+        10): the fix, per Thorlabs, is to re-home to a known reference and move again.
+        Re-homing on the spot and retrying keeps a long scan going instead of aborting
+        it partway through; only if it keeps failing does the error propagate.
+        """
+        for attempt in range(self.config.rehome_retries + 1):
+            try:
+                return self._position_reply("ma", self._counts_hex(raw),
+                                            timeout_s=self.config.move_timeout_s)
+            except ELLStatusError as error:
+                if not error.rehomeable or attempt == self.config.rehome_retries:
+                    raise
+                print(f"[ell] {error} re-homing and retrying "
+                      f"(attempt {attempt + 1}/{self.config.rehome_retries})")
+                self.home()
+        raise AssertionError("unreachable")  # the loop always returns or raises
 
     def wait_until_angle(self, angle_deg: float, arrived: Optional[float] = None) -> float:
         """Re-read the position until it is within tolerance of the target."""
@@ -703,10 +748,7 @@ class ELLStage:
             return value - 0x1_0000_0000 if value >= 0x8000_0000 else value
         if code == "GS":
             number = int(reply[3:5], 16)
-            raise RuntimeError(
-                f"The Elliptec mount refused '{command}': "
-                f"{ELL_STATUS.get(number, 'unknown status')} (code {number})."
-            )
+            raise ELLStatusError(command, number)
         raise RuntimeError(f"Unexpected reply to the Elliptec '{command}': {reply!r}")
 
     def _command(self, command: str, data: str = "",
@@ -1150,6 +1192,23 @@ class AnalyzerController:
 
     def disconnect(self) -> None:
         self.stage.disconnect()
+
+    @property
+    def is_ell_stage(self) -> bool:
+        """Whether the mount is a Thorlabs Elliptec one, driven over serial."""
+        return isinstance(self.stage, ELLStage)
+
+    def home(self) -> None:
+        """Re-home the mount to its reference position.
+
+        Only meaningful for an Elliptec analyzer: it needs re-homing before each new
+        laser angle or the following sweep does not move reliably. The Kinesis mount
+        does not, so this is called for the Elliptec case only (see `is_ell_stage`).
+        """
+        print(f"[analyzer] re-homing {self.element}")
+        self.stage.home()
+        if self.settle_time_s > 0 and not self.dry_run:
+            time.sleep(self.settle_time_s)
 
     def set_angle(self, angle_deg: float) -> float:
         """Turn the analyzer to `angle_deg`, then let the beam settle."""

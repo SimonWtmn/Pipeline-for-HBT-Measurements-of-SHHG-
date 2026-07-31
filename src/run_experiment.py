@@ -52,7 +52,7 @@ TODAY = datetime.now().strftime("%d%m%Y")
 CONFIG = ExperimentConfig(
     # ----------------- identity -----------------
     MATERIAL="CdTe110",
-    EXPERIENCE_TYPE="Ellipticity_Scan_Xaxis",
+    EXPERIENCE_TYPE="Ellipticity_Polarizer_Scan",
     DATE=TODAY,
     POWER_LEVEL="30mW",
 
@@ -77,8 +77,8 @@ CONFIG = ExperimentConfig(
     DEADTIMES_PS={},
     CORR_BINWIDTH_PS=300,
     CORR_N_BINS=2009,
-    ACQUISITION_DURATION_S=5,
-    CHUNK_DURATION_S=5,
+    ACQUISITION_DURATION_S=2,
+    CHUNK_DURATION_S=2,
     SAVE_MERGED=True,
     EXPORT_FORMAT="pkl",
     SAVE_RAW_TTBIN=False,
@@ -125,18 +125,14 @@ CONFIG = ExperimentConfig(
 
     # ----------------- ellipticity scan -----------------
     # ELLIPTICITY_LASER_ANGLES=None,
-    ELLIPTICITY_LASER_ANGLES=np.arange(100.0, 115.0, 2.0),    # the outer loop
-    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 4.0),   # the inner loop
-    # "polarizer" turns the polarizer itself on the Elliptec mount, with no HWP in the
-    # beam; "hwp" is the older setup, the Kinesis half-wave plate in front of the fixed
-    # vertical polarizer. Swap the two ELLIPTICITY_ANALYZER lines below with it.
+    ELLIPTICITY_LASER_ANGLES=np.union1d(np.arange(0.0, 181.0, 4.0), [18.0]), 
+    ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 5.0),   # the inner loop
     ELLIPTICITY_ANALYZER_KIND="polarizer",
-    ELLIPTICITY_ANALYZER=ELLStageConfig(port="COM6",       # <- the Elliptec port
-                                        address="0", clockwise=True),
+    ELLIPTICITY_ANALYZER=ELLStageConfig(port="COM4", address="3", clockwise=True),
     # ELLIPTICITY_ANALYZER_KIND="hwp",
     # ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27264707", clockwise=True),
     ELLIPTICITY_ANALYZER_ENABLED=True,
-    ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
+    ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first if True
     ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
     ELLIPTICITY_FIT_PERIOD_DEG=None,        # None: 90 deg for the HWP, 180 for the polarizer
     ELLIPTICITY_FIXED_POLARIZER_DEG=0.0,    # metadata, HWP setup only: 0 = vertical
@@ -145,8 +141,8 @@ CONFIG = ExperimentConfig(
     # ----------------- analysis -----------------
     INTEGRATION_WINDOW=8,
     INTEGRATION_WINDOWS_SWEEP=np.arange(1, 31, 1),
-    RUN_ANALYSIS_AFTER_ACQUIRE=True,
-    ANALYZE_ONLY=False,
+    RUN_ANALYSIS_AFTER_ACQUIRE=False,
+    ANALYZE_ONLY=True,
 )
 
 
@@ -403,6 +399,12 @@ def acquire_ellipticity_power(cfg: ExperimentConfig, pump: "hardware.PumpControl
                 continue
 
             setting = pump.set_polarization(laser_angle, cfg.PUMP_POWER)
+
+            # An Elliptec analyzer must be re-homed before each laser angle or the
+            # following sweep does not move reliably; the Kinesis HWP does not need it
+            # (and homing it every angle would only slow the scan down).
+            if analyzer.is_ell_stage:
+                analyzer.home()
 
             for index, (analyzer_angle, label) in enumerate(points, start=1):
                 print(f"\n===== analyzer {index}/{len(points)}: "
