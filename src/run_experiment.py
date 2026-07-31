@@ -46,7 +46,7 @@ except ImportError:
 CONFIG = ExperimentConfig(
     # ----------------- identity -----------------
     MATERIAL="CdTe110",
-    EXPERIENCE_TYPE="Ellipticity_Scan",
+    EXPERIENCE_TYPE="Ellipticity_Scan_Xaxis",
     DATE="31072026",
     POWER_LEVEL="30mW",
 
@@ -71,8 +71,8 @@ CONFIG = ExperimentConfig(
     DEADTIMES_PS={},
     CORR_BINWIDTH_PS=300,
     CORR_N_BINS=2009,
-    ACQUISITION_DURATION_S=15,
-    CHUNK_DURATION_S=3,
+    ACQUISITION_DURATION_S=5,
+    CHUNK_DURATION_S=5,
     SAVE_MERGED=True,
     EXPORT_FORMAT="pkl",
     SAVE_RAW_TTBIN=False,
@@ -119,12 +119,10 @@ CONFIG = ExperimentConfig(
 
     # ----------------- ellipticity scan -----------------
     # ELLIPTICITY_LASER_ANGLES=None,
-    ELLIPTICITY_LASER_ANGLES=np.union1d(
-        np.arange(0.0, 181.0, 4.0), [18.0]
-    ),          # the outer loop
+    ELLIPTICITY_LASER_ANGLES=np.arange(100.0, 115.0, 2.0),    # the outer loop
     ELLIPTICITY_ANALYZER_ANGLES=np.arange(0.0, 181.0, 4.0),   # the inner loop
     ELLIPTICITY_ANALYZER_ENABLED=True,
-    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27264707", clockwise=True),
+    ELLIPTICITY_ANALYZER=RotationStageConfig(serial_number="27264707", clockwise=True), #
     ELLIPTICITY_ANALYZER_DRY_RUN=False,     # rehearse first, as above
     ELLIPTICITY_ANALYZER_SETTLE_TIME_S=0.2,
     ELLIPTICITY_FIT_PERIOD_DEG=90.0,        # 90 deg for a half-wave plate, 180 def for a quarter-wave plate
